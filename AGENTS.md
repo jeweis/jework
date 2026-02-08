@@ -5,7 +5,7 @@
 ## 1. 项目定位
 - 技术栈：Python + FastAPI。
 - 当前阶段：v0.1（只读 Agent）。
-- 目标：提供工作目录列表、会话创建、消息流式回复接口，并在同端口托管前端静态资源。
+- 目标：提供工作空间列表、会话创建、消息流式回复接口，并在同端口托管前端静态资源。
 
 ## 2. 运行与开发
 - 推荐环境：`uv` 虚拟环境（必须）。
@@ -22,13 +22,13 @@
 ## 3. 关键配置
 - `DATA_DIR`：统一数据根目录（环境变量）。
   - 默认：`./data`
-  - 工作目录固定：`$DATA_DIR/workspaces`
+  - 工作空间固定：`$DATA_DIR/workspaces`
   - SQLite 固定：`$DATA_DIR/db/app.db`
 - `FRONTEND_STATIC_DIR`：前端静态资源目录。
   - 默认：`./app/static`
 
 ## 4. API 约束（v0.1）
-- `GET /workspaces`：读取工作目录列表（只读）。
+- `GET /workspaces`：读取工作空间列表（只读）。
 - `POST /sessions`：基于已有 workspace 创建会话。
 - `POST /sessions/{id}/messages`：流式返回消息。
 - 仅允许 Agent 使用 `Read` 工具，禁止写入类工具。
