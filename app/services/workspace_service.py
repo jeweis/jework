@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -31,6 +32,8 @@ from app.services.workspace_note_service import (
     WorkspaceNoteService,
     workspace_note_service,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -172,8 +175,6 @@ class WorkspaceService:
             "clone",
             "--depth",
             "1",
-            "--recurse-submodules",
-            "--shallow-submodules",
         ]
         command.extend([git_url, str(target)])
         try:
@@ -197,6 +198,31 @@ class WorkspaceService:
         except subprocess.CalledProcessError as exc:
             reason = (exc.stderr or exc.stdout or "git clone failed").strip()
             raise WorkspaceCreateError(target.name, reason) from exc
+
+        # 决策背景（2026-02 热修）：
+        # 线上出现“父仓记录的子模块 commit 在远端不可达（unadvertised object）”问题，
+        # 该问题会导致工作空间创建整体失败。为保证主流程可用，先采用兼容策略：
+        # 1) 主仓 clone 成功即可保留工作空间；
+        # 2) 子模块不再强依赖父仓锁定 commit，改为按远端默认分支拉取；
+        # 3) 单个子模块失败仅记录告警，不阻断其他子模块和主仓使用。
+        # 取舍：该策略牺牲了子模块版本的严格可复现性，后续可再引入“严格模式”开关。
+        self._run_git(
+            target,
+            ["submodule", "sync", "--recursive"],
+            git_username=normalized_user,
+            git_pat=normalized_pat,
+        )
+        _, _, warnings = self._update_submodules_best_effort(
+            repo_dir=target,
+            git_username=normalized_user,
+            git_pat=normalized_pat,
+        )
+        if warnings:
+            logger.warning(
+                "Workspace clone submodules partial failed: workspace=%s warnings=%s",
+                target.name,
+                warnings,
+            )
 
     def _validate_workspace_name(self, workspace: str) -> None:
         if not workspace or "/" in workspace or "\\" in workspace or ".." in workspace:
@@ -237,11 +263,14 @@ class WorkspaceService:
                 git_username=username,
                 git_pat=pat,
             )
-            self._run_git(
-                target,
-                ["submodule", "update", "--init", "--recursive", "--remote"],
-                git_username=username,
-                git_pat=pat,
+            # 与创建流程保持一致：
+            # pull 时对子模块采用“尽力而为”策略，避免单个子模块异常导致整仓 pull 失败。
+            submodule_success_count, submodule_fail_count, submodule_warnings = (
+                self._update_submodules_best_effort(
+                    repo_dir=target,
+                    git_username=username,
+                    git_pat=pat,
+                )
             )
             after_commit = self._run_git(
                 target,
@@ -251,6 +280,17 @@ class WorkspaceService:
             )
             changed = before_commit != after_commit
             summary = "代码已更新" if changed else "已是最新，无需更新"
+            if submodule_success_count or submodule_fail_count:
+                summary = (
+                    f"{summary}（子模块成功 {submodule_success_count}，"
+                    f"失败 {submodule_fail_count}）"
+                )
+            if submodule_warnings:
+                logger.warning(
+                    "Workspace pull submodules partial failed: workspace=%s warnings=%s",
+                    workspace,
+                    submodule_warnings,
+                )
             pulled_at = datetime.now(timezone.utc).isoformat()
             if self._git_service is not None:
                 self._git_service.set_pull_result(
@@ -339,6 +379,86 @@ class WorkspaceService:
             raise WorkspaceCredentialError(
                 "PAT authentication only supports https repository URL"
             )
+
+    def _update_submodules_best_effort(
+        self,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> tuple[int, int, list[str]]:
+        # 设计意图：
+        # 逐个子模块更新并汇总结果，失败继续，最后返回成功/失败统计与告警明细。
+        # 这样上层可以把“部分成功”反馈给用户，而不是直接中断整个请求。
+        paths = self._list_submodule_paths(repo_dir=repo_dir)
+        success_count = 0
+        fail_count = 0
+        warnings: list[str] = []
+
+        for path in paths:
+            try:
+                self._run_git(
+                    repo_dir,
+                    [
+                        "submodule",
+                        "update",
+                        "--init",
+                        "--depth",
+                        "1",
+                        "--remote",
+                        path,
+                    ],
+                    git_username=git_username,
+                    git_pat=git_pat,
+                )
+                success_count += 1
+            except WorkspaceCreateError as exc:
+                fail_count += 1
+                reason = (
+                    str(exc.details.get("reason"))
+                    if isinstance(exc.details, dict)
+                    and exc.details.get("reason") is not None
+                    else str(exc)
+                )
+                warnings.append(f"{path}: {reason}")
+                continue
+
+            nested_repo = (repo_dir / path).resolve()
+            # 递归处理嵌套子模块，确保多级 submodule 也遵循相同容错策略。
+            (
+                nested_success_count,
+                nested_fail_count,
+                nested_warnings,
+            ) = self._update_submodules_best_effort(
+                repo_dir=nested_repo,
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            success_count += nested_success_count
+            fail_count += nested_fail_count
+            warnings.extend([f"{path}/{item}" for item in nested_warnings])
+
+        return success_count, fail_count, warnings
+
+    def _list_submodule_paths(self, repo_dir: Path) -> list[str]:
+        gitmodules_file = (repo_dir / ".gitmodules").resolve()
+        if not gitmodules_file.exists():
+            return []
+        output = self._run_git(
+            repo_dir,
+            ["config", "-f", ".gitmodules", "--get-regexp", "path"],
+        )
+        paths: list[str] = []
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split(maxsplit=1)
+            if len(parts) != 2:
+                continue
+            path = parts[1].strip()
+            if path:
+                paths.append(path)
+        return paths
 
     @contextmanager
     def _git_process_env(
