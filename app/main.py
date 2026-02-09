@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from app.api.branch_routes import router as branch_router
 from app.api.routes import router
 from app.core.config import settings
 from app.core.errors import register_exception_handlers
@@ -12,6 +13,7 @@ from app.services.workspace_git_service import workspace_git_service
 app = FastAPI(title="Jework", version="0.1.0")
 register_exception_handlers(app)
 app.include_router(router)
+app.include_router(branch_router)
 
 _STATIC_DIR = settings.frontend_static_dir
 _INDEX_FILE = _STATIC_DIR / "index.html"
