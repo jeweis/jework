@@ -3,9 +3,9 @@
     "short_name": "Jework",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#ECFEFF",
+    "theme_color": "#0891B2",
+    "description": "Jework · AI 协作工作空间",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
