@@ -7,7 +7,7 @@ from app.core.errors import AgentInvocationError
 
 logger = logging.getLogger(__name__)
 DEFAULT_AGENT_MAX_TURNS = 20
-DEFAULT_READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+DEFAULT_READ_ONLY_TOOLS = ["Skill", "Read", "Glob", "Grep", "WebSearch", "WebFetch"]
 
 
 def _resolve_agent_max_turns() -> int:

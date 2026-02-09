@@ -37,7 +37,7 @@ Claude Agent 相关可选环境变量：
 
 - `CLAUDE_AGENT_MAX_TURNS`：单次请求最大循环次数（默认 `20`）
 - `CLAUDE_AGENT_ALLOWED_TOOLS`：允许工具列表，逗号分隔  
-  默认只读工具集：`Read,Glob,Grep,WebSearch,WebFetch`
+  默认工具集：`Skill,Read,Glob,Grep,WebSearch,WebFetch`
 
 工作空间 PAT 加密密钥默认会在首次使用时自动生成并写入 SQLite，普通部署无需额外配置。  
 仅在多实例共享同一数据库等高级场景下，才建议显式设置 `APP_SECRET_KEY` 做统一覆盖。
