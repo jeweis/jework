@@ -27,6 +27,10 @@ class AuthUser:
     username: str
     role: str
     created_at: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    feishu_union_id: str | None = None
+    feishu_open_id: str | None = None
     accessible_workspaces: list[str] | None = None
 
 
@@ -72,6 +76,7 @@ class AuthService:
                 )
                 """
             )
+            self._ensure_user_extension_columns(conn)
             conn.commit()
 
     def requires_bootstrap(self) -> bool:
@@ -111,7 +116,12 @@ class AuthService:
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT id, username, password_hash, role, created_at FROM users WHERE username=?",
+                """
+                SELECT id, username, password_hash, role, created_at,
+                       display_name, avatar_url, feishu_union_id, feishu_open_id
+                FROM users
+                WHERE username = ?
+                """,
                 (username,),
             ).fetchone()
 
@@ -136,15 +146,127 @@ class AuthService:
                 username=row["username"],
                 role=row["role"],
                 created_at=row["created_at"],
+                display_name=row["display_name"],
+                avatar_url=row["avatar_url"],
+                feishu_union_id=row["feishu_union_id"],
+                feishu_open_id=row["feishu_open_id"],
             )
             return token, user
+
+    def login_by_feishu(
+        self,
+        *,
+        union_id: str,
+        open_id: str | None,
+        name: str,
+        avatar_url: str | None,
+        default_workspace_names: list[str] | None = None,
+    ) -> tuple[str, AuthUser, bool]:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        first_login = False
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            self._ensure_user_extension_columns(conn)
+            row = conn.execute(
+                """
+                SELECT id, username, role, created_at,
+                       display_name, avatar_url, feishu_union_id, feishu_open_id
+                FROM users
+                WHERE feishu_union_id = ?
+                LIMIT 1
+                """,
+                (union_id,),
+            ).fetchone()
+
+            if row is None:
+                first_login = True
+                username = self._generate_unique_feishu_username(conn, union_id)
+                password_hash = self._hash_password(secrets.token_urlsafe(32))
+                cursor = conn.execute(
+                    """
+                    INSERT INTO users (
+                        username, password_hash, role, created_at,
+                        display_name, avatar_url, feishu_union_id, feishu_open_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        username,
+                        password_hash,
+                        "user",
+                        now_text,
+                        name,
+                        avatar_url,
+                        union_id,
+                        open_id,
+                    ),
+                )
+                user_id = int(cursor.lastrowid)
+                workspace_rows = [
+                    (user_id, workspace, now_text, now_text)
+                    for workspace in sorted(set(default_workspace_names or []))
+                    if workspace.strip()
+                ]
+                if workspace_rows:
+                    # 首次飞书建号时按配置授予默认工作空间权限。
+                    conn.executemany(
+                        """
+                        INSERT INTO user_workspace_access
+                        (user_id, workspace, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        workspace_rows,
+                    )
+                user = AuthUser(
+                    id=user_id,
+                    username=username,
+                    role="user",
+                    created_at=now_text,
+                    display_name=name,
+                    avatar_url=avatar_url,
+                    feishu_union_id=union_id,
+                    feishu_open_id=open_id,
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET display_name = ?, avatar_url = ?, feishu_open_id = ?
+                    WHERE id = ?
+                    """,
+                    (name, avatar_url, open_id, row["id"]),
+                )
+                user = AuthUser(
+                    id=row["id"],
+                    username=row["username"],
+                    role=row["role"],
+                    created_at=row["created_at"],
+                    display_name=name,
+                    avatar_url=avatar_url,
+                    feishu_union_id=row["feishu_union_id"],
+                    feishu_open_id=open_id,
+                )
+
+            token = secrets.token_urlsafe(48)
+            expires = now + timedelta(hours=self._token_ttl_hours)
+            conn.execute(
+                """
+                INSERT INTO auth_tokens (token, user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (token, user.id, now_text, expires.isoformat()),
+            )
+            conn.commit()
+        return token, user, first_login
 
     def get_user_by_token(self, token: str) -> AuthUser:
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
-                SELECT u.id, u.username, u.role, u.created_at, t.expires_at
+                SELECT u.id, u.username, u.role, u.created_at, t.expires_at,
+                       u.display_name, u.avatar_url, u.feishu_union_id, u.feishu_open_id
                 FROM auth_tokens t
                 JOIN users u ON u.id = t.user_id
                 WHERE t.token = ?
@@ -165,6 +287,10 @@ class AuthService:
                 username=row["username"],
                 role=row["role"],
                 created_at=row["created_at"],
+                display_name=row["display_name"],
+                avatar_url=row["avatar_url"],
+                feishu_union_id=row["feishu_union_id"],
+                feishu_open_id=row["feishu_open_id"],
             )
 
     def create_user(
@@ -225,13 +351,18 @@ class AuthService:
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, username, role, created_at FROM users ORDER BY id ASC"
+                """
+                SELECT id, username, role, created_at, display_name
+                FROM users
+                ORDER BY id ASC
+                """
             ).fetchall()
             access_map = self._query_user_workspace_access_map(conn)
             return [
                 AuthUser(
                     id=row["id"],
                     username=row["username"],
+                    display_name=row["display_name"],
                     role=row["role"],
                     created_at=row["created_at"],
                     accessible_workspaces=access_map.get(row["id"], []),
@@ -377,6 +508,52 @@ class AuthService:
             "sha256", password.encode("utf-8"), salt, iterations
         )
         return hmac.compare_digest(actual, expected)
+
+    def _ensure_user_extension_columns(self, conn: sqlite3.Connection) -> None:
+        """
+        兼容历史数据库结构的无损升级。
+
+        说明：
+        - 线上已有 users 表时，不做破坏性迁移，仅补充飞书相关扩展列。
+        - 该升级逻辑可重复执行，确保应用每次启动都能自修复缺失列。
+        """
+        rows = conn.execute("PRAGMA table_info(users)").fetchall()
+        existing = {str(row[1]) for row in rows}
+        required_sql: dict[str, str] = {
+            "display_name": "ALTER TABLE users ADD COLUMN display_name TEXT",
+            "avatar_url": "ALTER TABLE users ADD COLUMN avatar_url TEXT",
+            "feishu_union_id": "ALTER TABLE users ADD COLUMN feishu_union_id TEXT",
+            "feishu_open_id": "ALTER TABLE users ADD COLUMN feishu_open_id TEXT",
+        }
+        for column, sql in required_sql.items():
+            if column not in existing:
+                conn.execute(sql)
+
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_union_id
+            ON users(feishu_union_id)
+            WHERE feishu_union_id IS NOT NULL
+            """
+        )
+
+    def _generate_unique_feishu_username(
+        self, conn: sqlite3.Connection, union_id: str
+    ) -> str:
+        # username 规则需要兼容现有校验（3~32，字母数字_.-）
+        digest = hashlib.sha256(union_id.encode("utf-8")).hexdigest()[:16]
+        base = f"feishu_{digest}"
+        candidate = base
+        suffix = 1
+        while True:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE username = ? LIMIT 1",
+                (candidate,),
+            ).fetchone()
+            if row is None:
+                return candidate
+            suffix += 1
+            candidate = f"{base}_{suffix}"
 
 
 auth_service = AuthService(str(settings.sqlite_db_path))

@@ -6,6 +6,7 @@ from app.api.routes import router
 from app.core.config import settings
 from app.core.errors import register_exception_handlers
 from app.services.auth_service import auth_service
+from app.services.feishu_settings_service import feishu_settings_service
 from app.services.llm_config_service import llm_config_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
@@ -22,6 +23,7 @@ _INDEX_FILE = _STATIC_DIR / "index.html"
 @app.on_event("startup")
 def _startup() -> None:
     auth_service.init_db()
+    feishu_settings_service.init_db()
     llm_config_service.init_db()
     workspace_credential_service.init_db()
     workspace_git_service.init_db()

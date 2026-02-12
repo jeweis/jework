@@ -32,8 +32,112 @@
 
   <title>Jework</title>
   <link rel="manifest" href="manifest.json">
+
+  <!--
+    飞书 H5 JSSDK：
+    - 免登流程依赖 window.h5sdk / window.tt。
+    - 仅在飞书容器环境可用，外部浏览器不会注入可调用能力。
+    - 版本号参考飞书官方示例，可按官方后续推荐版本升级。
+  -->
+  <script
+    type="text/javascript"
+    src="https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.26.js"
+  ></script>
+
+  <!--
+    飞书网页应用远程调试脚本：
+    - 直接注入，便于在飞书网页应用调试工具中快速建立调试连接。
+  -->
+  <script src="https://lf-package-cn.feishucdn.com/obj/feishu-static/op/fe/devtools_frontend/remote-debug-0.0.1-alpha.6.js"></script>
 </head>
 <body>
+  <script>
+    (function () {
+      function isFeishuRuntime() {
+        if (!window.tt) {
+          return false;
+        }
+        return (
+          typeof window.tt.requestAccess === "function" ||
+          typeof window.tt.requestAuthCode === "function"
+        );
+      }
+
+      function waitForRuntimeReady() {
+        return new Promise(function (resolve, reject) {
+          if (!isFeishuRuntime()) {
+            reject(new Error("not_feishu_runtime"));
+            return;
+          }
+
+          // 免登 API 官方要求在 h5sdk.ready 触发后调用；若 SDK 不可用则回退直调 tt。
+          if (
+            window.h5sdk &&
+            typeof window.h5sdk.ready === "function"
+          ) {
+            window.h5sdk.ready(function () {
+              resolve(window.tt);
+            });
+            return;
+          }
+
+          resolve(window.tt);
+        });
+      }
+
+      function callRequestAuthCode(tt, appId) {
+        return new Promise(function (resolve, reject) {
+          tt.requestAuthCode({
+            appId: appId,
+            success: function (res) {
+              if (res && res.code) {
+                resolve(res.code);
+                return;
+              }
+              reject(new Error("auth_code_missing"));
+            },
+            fail: function (err) {
+              reject(new Error("request_auth_code_failed:" + JSON.stringify(err || {})));
+            },
+          });
+        });
+      }
+
+      function getAuthCode(appId) {
+        return waitForRuntimeReady().then(function (tt) {
+          return new Promise(function (resolve, reject) {
+            if (tt.requestAccess) {
+              tt.requestAccess({
+                appID: appId,
+                scopeList: [],
+                success: function (res) {
+                  if (res && res.code) {
+                    resolve(res.code);
+                    return;
+                  }
+                  reject(new Error("auth_code_missing"));
+                },
+                fail: function (err) {
+                  if (err && err.errno === 103) {
+                    callRequestAuthCode(tt, appId).then(resolve).catch(reject);
+                    return;
+                  }
+                  reject(new Error("request_access_failed:" + JSON.stringify(err || {})));
+                },
+              });
+              return;
+            }
+            callRequestAuthCode(tt, appId).then(resolve).catch(reject);
+          });
+        });
+      }
+
+      window.jeworkFeishuAuth = {
+        isFeishuRuntime: isFeishuRuntime,
+        getAuthCode: getAuthCode,
+      };
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

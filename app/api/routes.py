@@ -10,6 +10,9 @@ from app.core.errors import AuthForbiddenError
 from app.models.schemas import (
     BootstrapRequest,
     BootstrapStatusResponse,
+    FeishuLoginRequest,
+    FeishuSettingsItem,
+    FeishuStatusResponse,
     CreateLlmConfigRequest,
     CreateSessionRequest,
     CreateSessionResponse,
@@ -29,6 +32,7 @@ from app.models.schemas import (
     SessionSummaryItem,
     UpdateLlmConfigRequest,
     UpdateUserWorkspaceAccessRequest,
+    UpdateFeishuSettingsRequest,
     UpdateWorkspaceCredentialRequest,
     UpdateWorkspaceNoteRequest,
     UserListResponse,
@@ -42,6 +46,8 @@ from app.models.schemas import (
 )
 from app.services.agent_service import stream_agent_response
 from app.services.auth_service import AuthUser, auth_service
+from app.services.feishu_auth_service import feishu_auth_service
+from app.services.feishu_settings_service import feishu_settings_service
 from app.services.llm_config_service import llm_config_service
 from app.services.markdown_service import markdown_service
 from app.services.session_service import session_service
@@ -65,6 +71,7 @@ def bootstrap(body: BootstrapRequest) -> UserResponse:
     return UserResponse(
         id=user.id,
         username=user.username,
+        display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
         accessible_workspaces=[],
@@ -80,6 +87,47 @@ def login(body: LoginRequest) -> LoginResponse:
         user=UserResponse(
             id=user.id,
             username=user.username,
+            display_name=user.display_name,
+            role=user.role,
+            created_at=user.created_at,
+            accessible_workspaces=accessible,
+        ),
+    )
+
+
+@router.get("/auth/feishu/status", response_model=FeishuStatusResponse)
+def feishu_status() -> FeishuStatusResponse:
+    status = feishu_settings_service.get_public_status()
+    return FeishuStatusResponse(enabled=status.enabled, app_id=status.app_id)
+
+
+@router.post("/auth/feishu/login", response_model=LoginResponse)
+def feishu_login(body: FeishuLoginRequest) -> LoginResponse:
+    config = feishu_settings_service.assert_login_enabled()
+    user_access_token = feishu_auth_service.exchange_code_v2(
+        base_url=config.base_url,
+        app_id=config.app_id or "",
+        app_secret=config.app_secret or "",
+        code=body.code,
+    )
+    user_info = feishu_auth_service.get_user_info(
+        base_url=config.base_url,
+        user_access_token=user_access_token,
+    )
+    token, user, _ = auth_service.login_by_feishu(
+        union_id=user_info.union_id,
+        open_id=user_info.open_id,
+        name=user_info.name,
+        avatar_url=user_info.avatar_url,
+        default_workspace_names=config.default_workspace_names,
+    )
+    accessible = auth_service.get_accessible_workspaces(user)
+    return LoginResponse(
+        token=token,
+        user=UserResponse(
+            id=user.id,
+            username=user.username,
+            display_name=user.display_name,
             role=user.role,
             created_at=user.created_at,
             accessible_workspaces=accessible,
@@ -93,6 +141,7 @@ def get_me(current_user: AuthUser = Depends(get_current_user)) -> UserResponse:
     return UserResponse(
         id=current_user.id,
         username=current_user.username,
+        display_name=current_user.display_name,
         role=current_user.role,
         created_at=current_user.created_at,
         accessible_workspaces=accessible,
@@ -107,12 +156,52 @@ def list_users(current_user: AuthUser = Depends(get_current_user)) -> UserListRe
             UserResponse(
                 id=user.id,
                 username=user.username,
+                display_name=user.display_name,
                 role=user.role,
                 created_at=user.created_at,
                 accessible_workspaces=user.accessible_workspaces or [],
             )
             for user in users
         ]
+    )
+
+
+@router.get("/admin/feishu/settings", response_model=FeishuSettingsItem)
+def get_feishu_settings(
+    current_user: AuthUser = Depends(get_current_user),
+) -> FeishuSettingsItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = feishu_settings_service.get_settings_view()
+    return FeishuSettingsItem(
+        enabled=item.enabled,
+        app_id=item.app_id,
+        has_app_secret=item.has_app_secret,
+        base_url=item.base_url,
+        default_workspace_names=item.default_workspace_names,
+    )
+
+
+@router.put("/admin/feishu/settings", response_model=FeishuSettingsItem)
+def update_feishu_settings(
+    body: UpdateFeishuSettingsRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> FeishuSettingsItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = feishu_settings_service.update_settings(
+        enabled=body.enabled,
+        app_id=body.app_id,
+        app_secret=body.app_secret,
+        base_url=body.base_url,
+        default_workspace_names=body.default_workspace_names,
+    )
+    return FeishuSettingsItem(
+        enabled=item.enabled,
+        app_id=item.app_id,
+        has_app_secret=item.has_app_secret,
+        base_url=item.base_url,
+        default_workspace_names=item.default_workspace_names,
     )
 
 
@@ -130,6 +219,7 @@ def create_user(
     return UserResponse(
         id=user.id,
         username=user.username,
+        display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
         accessible_workspaces=user.accessible_workspaces or [],
@@ -157,6 +247,7 @@ def update_user_workspaces(
     return UserResponse(
         id=target.id,
         username=target.username,
+        display_name=target.display_name,
         role=target.role,
         created_at=target.created_at,
         accessible_workspaces=[] if target.role == "superadmin" else accessible,

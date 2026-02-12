@@ -128,6 +128,7 @@ class LoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: int
     username: str
+    display_name: str | None = None
     role: str
     created_at: str
     accessible_workspaces: list[str] = Field(default_factory=list)
@@ -136,6 +137,31 @@ class UserResponse(BaseModel):
 class LoginResponse(BaseModel):
     token: str
     user: UserResponse
+
+
+class FeishuStatusResponse(BaseModel):
+    enabled: bool
+    app_id: str | None = None
+
+
+class FeishuLoginRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=2048)
+
+
+class FeishuSettingsItem(BaseModel):
+    enabled: bool
+    app_id: str | None = None
+    has_app_secret: bool = False
+    base_url: str = "https://open.feishu.cn"
+    default_workspace_names: list[str] = Field(default_factory=list)
+
+
+class UpdateFeishuSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    app_id: str | None = Field(default=None, max_length=128)
+    app_secret: str | None = Field(default=None, max_length=512)
+    base_url: str | None = Field(default=None, max_length=256)
+    default_workspace_names: list[str] | None = None
 
 
 class CreateUserRequest(BaseModel):
