@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi.responses import JSONResponse
+from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
@@ -132,10 +133,32 @@ def build_fastmcp_asgi_app():
         description="列出工作空间目录中的文件",
     )
     def list_files(
-        workspace: str | None = None,
-        path: str = ".",
-        depth: int = 2,
-        include_hidden: bool = False,
+        workspace: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
+                ),
+            ),
+        ] = None,
+        path: Annotated[
+            str,
+            Field(
+                description="要遍历的相对路径，默认根目录“.”。",
+            ),
+        ] = ".",
+        depth: Annotated[
+            int,
+            Field(
+                description="目录遍历深度，建议 0-8，默认 2。",
+            ),
+        ] = 2,
+        include_hidden: Annotated[
+            bool,
+            Field(
+                description="是否包含隐藏文件/目录（以 . 开头）。",
+            ),
+        ] = False,
     ) -> dict[str, Any]:
         return _safe_tool_call(
             "list_files",
@@ -152,10 +175,28 @@ def build_fastmcp_asgi_app():
         description="按行读取文件内容",
     )
     def read_file(
-        path: str,
-        workspace: str | None = None,
-        start_line: int = 1,
-        end_line: int = 300,
+        path: Annotated[
+            str,
+            Field(
+                description="要读取的文件相对路径（必填）。",
+            ),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
+                ),
+            ),
+        ] = None,
+        start_line: Annotated[
+            int,
+            Field(description="起始行号（从 1 开始）。"),
+        ] = 1,
+        end_line: Annotated[
+            int,
+            Field(description="结束行号（包含该行）。"),
+        ] = 300,
     ) -> dict[str, Any]:
         return _safe_tool_call(
             "read_file",
@@ -172,10 +213,32 @@ def build_fastmcp_asgi_app():
         description="关键词/正则查找文件片段",
     )
     def grep_files(
-        pattern: str,
-        workspace: str | None = None,
-        glob: str = "**/*",
-        top_k: int = 20,
+        pattern: Annotated[
+            str,
+            Field(
+                description="关键词或正则表达式（必填）。",
+            ),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
+                ),
+            ),
+        ] = None,
+        glob: Annotated[
+            str,
+            Field(
+                description=(
+                    "文件过滤模式（glob），默认 '**/*'。"
+                ),
+            ),
+        ] = "**/*",
+        top_k: Annotated[
+            int,
+            Field(description="最多返回匹配条数，默认 20。"),
+        ] = 20,
     ) -> dict[str, Any]:
         return _safe_tool_call(
             "grep_files",
@@ -192,9 +255,22 @@ def build_fastmcp_asgi_app():
         description="向量语义检索（代码与文档）",
     )
     def semantic_search(
-        query: str,
-        workspace: str | None = None,
-        top_k: int = 8,
+        query: Annotated[
+            str,
+            Field(description="语义检索查询文本（必填）。"),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
+                ),
+            ),
+        ] = None,
+        top_k: Annotated[
+            int,
+            Field(description="返回结果数量，默认 8。"),
+        ] = 8,
     ) -> dict[str, Any]:
         return _safe_tool_call(
             "semantic_search",
@@ -210,9 +286,22 @@ def build_fastmcp_asgi_app():
         description="向量召回 + 关键词重排",
     )
     def hybrid_search(
-        query: str,
-        workspace: str | None = None,
-        top_k: int = 8,
+        query: Annotated[
+            str,
+            Field(description="混合检索查询文本（必填）。"),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
+                ),
+            ),
+        ] = None,
+        top_k: Annotated[
+            int,
+            Field(description="返回结果数量，默认 8。"),
+        ] = 8,
     ) -> dict[str, Any]:
         return _safe_tool_call(
             "hybrid_search",
