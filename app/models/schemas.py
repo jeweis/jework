@@ -236,6 +236,41 @@ class McpIndexJobItem(BaseModel):
     updated_at: str
 
 
+class McpIndexJobListResponse(BaseModel):
+    items: list[McpIndexJobItem]
+    total: int
+    page: int
+    size: int
+
+
+class McpIndexFailureItem(BaseModel):
+    job_id: str
+    workspace: str
+    path: str
+    reason: str
+    retry_count: int
+    created_at: str
+
+
+class McpIndexFailureListResponse(BaseModel):
+    items: list[McpIndexFailureItem]
+    total: int
+    page: int
+    size: int
+
+
+class RetryFailedJobsRequest(BaseModel):
+    workspace: str | None = None
+
+
+class RetryFailedJobsResponse(BaseModel):
+    items: list[McpIndexJobItem]
+
+
+class RetryJobFailurePathsRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+
+
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=6, max_length=128)

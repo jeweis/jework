@@ -10,7 +10,11 @@ import uuid
 
 from app.core.config import settings
 from app.core.errors import AppError
-from app.services.mcp_vector_service import IndexProgress, mcp_vector_service
+from app.services.mcp_vector_service import (
+    IndexFailureRecord,
+    IndexProgress,
+    mcp_vector_service,
+)
 
 
 @dataclass(frozen=True)
@@ -66,11 +70,220 @@ class McpIndexJobService:
             conn.commit()
 
     def create_job(self, *, user_id: int, workspace: str, mode: str) -> McpIndexJob:
+        return self._create_job_internal(
+            user_id=user_id,
+            workspace=workspace,
+            mode=mode,
+        )
+
+    def list_jobs(
+        self,
+        *,
+        requester_id: int,
+        requester_is_superadmin: bool,
+        workspace: str | None,
+        status: str | None,
+        page: int,
+        size: int,
+    ) -> tuple[list[McpIndexJob], int]:
+        page = max(1, page)
+        size = max(1, min(size, 200))
+        offset = (page - 1) * size
+
+        clauses: list[str] = []
+        params: list[object] = []
+
+        if not requester_is_superadmin:
+            clauses.append("user_id = ?")
+            params.append(requester_id)
+        if workspace:
+            clauses.append("workspace = ?")
+            params.append(workspace)
+        if status:
+            clauses.append("status = ?")
+            params.append(status.strip().lower())
+
+        where_clause = ""
+        if clauses:
+            where_clause = "WHERE " + " AND ".join(clauses)
+
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            total_row = conn.execute(
+                f"SELECT COUNT(1) AS cnt FROM mcp_index_jobs {where_clause}",
+                tuple(params),
+            ).fetchone()
+            total = int(total_row["cnt"] if total_row else 0)
+
+            rows = conn.execute(
+                f"""
+                SELECT job_id, user_id, workspace, mode, status,
+                       percent, total_files, total_chunks, processed_chunks,
+                       failed_chunks, elapsed_ms, error_message,
+                       created_at, updated_at
+                FROM mcp_index_jobs
+                {where_clause}
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, size, offset),
+            ).fetchall()
+            items = [self._to_job(row) for row in rows]
+            return items, total
+
+    def retry_job_failures(
+        self,
+        *,
+        source_job_id: str,
+        user_id: int,
+    ) -> McpIndexJob:
+        source = self.get_job(
+            job_id=source_job_id,
+            requester_id=user_id,
+            requester_is_superadmin=True,
+        )
+        if source.status != "failed":
+            raise AppError(
+                code="MCP_INDEX_JOB_NOT_FAILED",
+                message="only failed job can be retried",
+                details={"job_id": source_job_id, "status": source.status},
+                status_code=400,
+            )
+        failures = mcp_vector_service.list_failures(
+            workspace=source.workspace,
+            job_id=source_job_id,
+        )
+        if not failures:
+            raise AppError(
+                code="MCP_INDEX_JOB_NO_FAILURES",
+                message="no failure records found for this job",
+                details={"job_id": source_job_id},
+                status_code=400,
+            )
+        paths = [item.path for item in failures]
+        return self._create_job_internal(
+            user_id=user_id,
+            workspace=source.workspace,
+            mode="retry_failed",
+            source_job_id=source_job_id,
+            retry_paths=paths,
+        )
+
+    def list_job_failures(
+        self,
+        *,
+        source_job_id: str,
+        requester_id: int,
+        requester_is_superadmin: bool,
+        page: int,
+        size: int,
+    ) -> tuple[list[IndexFailureRecord], int]:
+        source = self.get_job(
+            job_id=source_job_id,
+            requester_id=requester_id,
+            requester_is_superadmin=requester_is_superadmin,
+        )
+        failures = mcp_vector_service.list_failures(
+            workspace=source.workspace,
+            job_id=source_job_id,
+        )
+        page = max(1, page)
+        size = max(1, min(size, 500))
+        offset = (page - 1) * size
+        paged = failures[offset : offset + size]
+        return paged, len(failures)
+
+    def retry_job_failure_paths(
+        self,
+        *,
+        source_job_id: str,
+        user_id: int,
+        paths: list[str],
+    ) -> McpIndexJob:
+        source = self.get_job(
+            job_id=source_job_id,
+            requester_id=user_id,
+            requester_is_superadmin=True,
+        )
+        failures = mcp_vector_service.list_failures(
+            workspace=source.workspace,
+            job_id=source_job_id,
+        )
+        if not failures:
+            raise AppError(
+                code="MCP_INDEX_JOB_NO_FAILURES",
+                message="no failure records found for this job",
+                details={"job_id": source_job_id},
+                status_code=400,
+            )
+
+        # 只允许重试当前失败清单中的文件，避免越权或误传路径触发无关扫描。
+        valid_paths = {item.path for item in failures}
+        normalized_paths = sorted({path.strip() for path in paths if path.strip()})
+        if not normalized_paths:
+            raise AppError(
+                code="MCP_INDEX_RETRY_PATHS_REQUIRED",
+                message="paths is required",
+                status_code=400,
+            )
+        invalid_paths = [path for path in normalized_paths if path not in valid_paths]
+        if invalid_paths:
+            raise AppError(
+                code="MCP_INDEX_RETRY_PATHS_INVALID",
+                message="some paths are not in failure records",
+                details={"invalid_paths": invalid_paths[:20]},
+                status_code=400,
+            )
+
+        return self._create_job_internal(
+            user_id=user_id,
+            workspace=source.workspace,
+            mode="retry_failed",
+            source_job_id=source_job_id,
+            retry_paths=normalized_paths,
+        )
+
+    def retry_all_failed_jobs(
+        self,
+        *,
+        user_id: int,
+        workspace: str | None = None,
+    ) -> list[McpIndexJob]:
+        jobs, _ = self.list_jobs(
+            requester_id=user_id,
+            requester_is_superadmin=True,
+            workspace=workspace,
+            status="failed",
+            page=1,
+            size=200,
+        )
+        created: list[McpIndexJob] = []
+        for job in jobs:
+            try:
+                created.append(
+                    self.retry_job_failures(
+                        source_job_id=job.job_id,
+                        user_id=user_id,
+                    )
+                )
+            except AppError:
+                continue
+        return created
+
+    def _create_job_internal(
+        self,
+        *,
+        user_id: int,
+        workspace: str,
+        mode: str,
+        source_job_id: str | None = None,
+        retry_paths: list[str] | None = None,
+    ) -> McpIndexJob:
         normalized_mode = mode.strip().lower()
-        if normalized_mode not in {"full", "incremental"}:
+        if normalized_mode not in {"full", "incremental", "retry_failed"}:
             raise AppError(
                 code="MCP_INDEX_JOB_INVALID_MODE",
-                message="mode must be full or incremental",
+                message="mode must be full/incremental/retry_failed",
                 details={"mode": mode},
                 status_code=400,
             )
@@ -113,6 +326,8 @@ class McpIndexJobService:
                 "job_id": job_id,
                 "workspace": workspace,
                 "mode": normalized_mode,
+                "source_job_id": source_job_id,
+                "retry_paths": retry_paths or [],
             },
             daemon=True,
         )
@@ -171,7 +386,15 @@ class McpIndexJobService:
             conn.commit()
             return int(cursor.rowcount or 0)
 
-    def _run_job(self, *, job_id: str, workspace: str, mode: str) -> None:
+    def _run_job(
+        self,
+        *,
+        job_id: str,
+        workspace: str,
+        mode: str,
+        source_job_id: str | None = None,
+        retry_paths: list[str],
+    ) -> None:
         lock = self._get_workspace_lock(workspace)
         if not lock.acquire(blocking=False):
             self._finalize_failed(job_id, "workspace has another running index job")
@@ -192,12 +415,27 @@ class McpIndexJobService:
                     elapsed_ms=progress.elapsed_ms,
                 )
 
-            result = mcp_vector_service.build_index(
-                workspace=workspace,
-                mode=mode,
-                job_id=job_id,
-                progress_callback=_on_progress,
-            )
+            if mode == "retry_failed":
+                if not source_job_id:
+                    raise AppError(
+                        code="MCP_INDEX_RETRY_SOURCE_REQUIRED",
+                        message="source_job_id is required for retry_failed",
+                        status_code=400,
+                    )
+                result = mcp_vector_service.retry_failed_paths(
+                    workspace=workspace,
+                    source_job_id=source_job_id,
+                    retry_job_id=job_id,
+                    paths=retry_paths,
+                    progress_callback=_on_progress,
+                )
+            else:
+                result = mcp_vector_service.build_index(
+                    workspace=workspace,
+                    mode=mode,
+                    job_id=job_id,
+                    progress_callback=_on_progress,
+                )
 
             self._update_progress(
                 job_id,

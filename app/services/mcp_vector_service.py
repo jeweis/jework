@@ -45,6 +45,16 @@ class IndexBuildResult:
     head_commit: str
 
 
+@dataclass(frozen=True)
+class IndexFailureRecord:
+    job_id: str
+    workspace: str
+    path: str
+    reason: str
+    retry_count: int
+    created_at: str
+
+
 class McpVectorService:
     """向量索引与检索服务。"""
 
@@ -801,6 +811,208 @@ class McpVectorService:
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (job_id, workspace, path, reason[:2000], retry_count, now),
+            )
+            conn.commit()
+
+    def list_failures(
+        self,
+        *,
+        workspace: str | None = None,
+        job_id: str | None = None,
+    ) -> list[IndexFailureRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if workspace:
+            clauses.append("workspace = ?")
+            params.append(workspace)
+        if job_id:
+            clauses.append("job_id = ?")
+            params.append(job_id)
+
+        where_clause = ""
+        if clauses:
+            where_clause = "WHERE " + " AND ".join(clauses)
+
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT job_id, workspace, path, reason, retry_count, created_at
+                FROM mcp_index_failures
+                {where_clause}
+                ORDER BY created_at DESC
+                """,
+                tuple(params),
+            ).fetchall()
+            return [
+                IndexFailureRecord(
+                    job_id=str(row["job_id"] or ""),
+                    workspace=str(row["workspace"] or ""),
+                    path=str(row["path"] or ""),
+                    reason=str(row["reason"] or ""),
+                    retry_count=int(row["retry_count"] or 0),
+                    created_at=str(row["created_at"] or ""),
+                )
+                for row in rows
+            ]
+
+    def retry_failed_paths(
+        self,
+        *,
+        workspace: str,
+        source_job_id: str,
+        retry_job_id: str,
+        paths: list[str],
+        progress_callback: Callable[[IndexProgress], None],
+    ) -> IndexBuildResult:
+        started = datetime.now(timezone.utc)
+        root = workspace_service.get_workspace_path(workspace)
+        head_commit = self._resolve_head_commit(root)
+        unique_paths = sorted({path.strip() for path in paths if path.strip()})
+        total_files = len(unique_paths)
+        total_chunks = 0
+        file_chunks: list[tuple[str, list[dict[str, object]]]] = []
+        missing_paths: list[str] = []
+
+        for path in unique_paths:
+            absolute = (root / path).resolve()
+            if not absolute.exists() or not absolute.is_file():
+                missing_paths.append(path)
+                continue
+            chunks = self._build_file_chunks(root, path)
+            file_chunks.append((path, chunks))
+            total_chunks += len(chunks)
+
+        processed = 0
+        failed = 0
+        progress_callback(
+            IndexProgress(
+                workspace=workspace,
+                total_files=total_files,
+                total_chunks=total_chunks,
+                processed_chunks=0,
+                failed_chunks=0,
+                elapsed_ms=0,
+                message="失败文件重试开始",
+            )
+        )
+
+        for path in missing_paths:
+            failed += 1
+            self._increment_retry_count(source_job_id, workspace, path)
+            self._record_failure(
+                retry_job_id,
+                workspace,
+                path,
+                "file not found during retry",
+                retry_count=1,
+            )
+            progress_callback(
+                IndexProgress(
+                    workspace=workspace,
+                    total_files=total_files,
+                    total_chunks=total_chunks,
+                    processed_chunks=processed,
+                    failed_chunks=failed,
+                    elapsed_ms=self._elapsed_ms(started),
+                    message=f"重试失败（文件不存在）: {path}",
+                )
+            )
+
+        batch_size = max(1, mcp_settings_service.get_settings().embedding_batch_size)
+        for path, chunks in file_chunks:
+            try:
+                self._delete_path_vectors(workspace=workspace, path=path)
+                if chunks:
+                    for offset in range(0, len(chunks), batch_size):
+                        part = chunks[offset : offset + batch_size]
+                        texts = [str(item["text"]) for item in part]
+                        vectors = self._embed_texts(texts)
+                        self._upsert_chunks(
+                            workspace=workspace,
+                            commit_sha=head_commit,
+                            path=path,
+                            chunks=part,
+                            vectors=vectors,
+                        )
+                        processed += len(part)
+                self._increment_retry_count(source_job_id, workspace, path)
+                self._delete_failure_rows(source_job_id, workspace, path)
+                progress_callback(
+                    IndexProgress(
+                        workspace=workspace,
+                        total_files=total_files,
+                        total_chunks=total_chunks,
+                        processed_chunks=processed,
+                        failed_chunks=failed,
+                        elapsed_ms=self._elapsed_ms(started),
+                        message=f"重试成功: {path}",
+                    )
+                )
+            except Exception as exc:
+                failed += max(1, len(chunks))
+                self._increment_retry_count(source_job_id, workspace, path)
+                self._record_failure(
+                    retry_job_id,
+                    workspace,
+                    path,
+                    f"retry failed: {exc}",
+                    retry_count=1,
+                )
+                progress_callback(
+                    IndexProgress(
+                        workspace=workspace,
+                        total_files=total_files,
+                        total_chunks=total_chunks,
+                        processed_chunks=processed,
+                        failed_chunks=failed,
+                        elapsed_ms=self._elapsed_ms(started),
+                        message=f"重试失败: {path}",
+                    )
+                )
+
+        elapsed_ms = self._elapsed_ms(started)
+        progress_callback(
+            IndexProgress(
+                workspace=workspace,
+                total_files=total_files,
+                total_chunks=total_chunks,
+                processed_chunks=processed,
+                failed_chunks=failed,
+                elapsed_ms=elapsed_ms,
+                message="失败文件重试完成",
+            )
+        )
+        return IndexBuildResult(
+            workspace=workspace,
+            total_files=total_files,
+            total_chunks=total_chunks,
+            processed_chunks=processed,
+            failed_chunks=failed,
+            elapsed_ms=elapsed_ms,
+            head_commit=head_commit,
+        )
+
+    def _delete_failure_rows(self, job_id: str, workspace: str, path: str) -> None:
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.execute(
+                """
+                DELETE FROM mcp_index_failures
+                WHERE job_id = ? AND workspace = ? AND path = ?
+                """,
+                (job_id, workspace, path),
+            )
+            conn.commit()
+
+    def _increment_retry_count(self, job_id: str, workspace: str, path: str) -> None:
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE mcp_index_failures
+                SET retry_count = retry_count + 1
+                WHERE job_id = ? AND workspace = ? AND path = ?
+                """,
+                (job_id, workspace, path),
             )
             conn.commit()
 

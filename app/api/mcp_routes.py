@@ -15,9 +15,15 @@ from app.core.errors import AppError, AuthForbiddenError
 from app.models.schemas import (
     CreateMcpIndexJobRequest,
     McpAuthInfoResponse,
+    McpIndexFailureItem,
+    McpIndexFailureListResponse,
     McpIndexJobItem,
+    McpIndexJobListResponse,
     McpResetTokenResponse,
     McpSettingsItem,
+    RetryJobFailurePathsRequest,
+    RetryFailedJobsRequest,
+    RetryFailedJobsResponse,
     UpdateMcpSettingsRequest,
 )
 from app.services.auth_service import AuthUser, auth_service
@@ -168,6 +174,108 @@ def get_mcp_index_job(
         requester_is_superadmin=current_user.role == "superadmin",
     )
     return _to_job_item(item)
+
+
+@router.get("/api/admin/mcp/index-jobs", response_model=McpIndexJobListResponse)
+def list_mcp_index_jobs(
+    current_user: AuthUser = Depends(get_current_user),
+    workspace: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    size: int = 20,
+) -> McpIndexJobListResponse:
+    items, total = mcp_index_job_service.list_jobs(
+        requester_id=current_user.id,
+        requester_is_superadmin=current_user.role == "superadmin",
+        workspace=_normalize_optional(workspace),
+        status=_normalize_optional(status),
+        page=page,
+        size=size,
+    )
+    return McpIndexJobListResponse(
+        items=[_to_job_item(item) for item in items],
+        total=total,
+        page=max(1, page),
+        size=max(1, min(size, 200)),
+    )
+
+
+@router.post(
+    "/api/admin/mcp/index-jobs/{job_id}/retry-failures",
+    response_model=McpIndexJobItem,
+)
+def retry_mcp_index_job_failures(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> McpIndexJobItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = mcp_index_job_service.retry_job_failures(
+        source_job_id=job_id,
+        user_id=current_user.id,
+    )
+    return _to_job_item(item)
+
+
+@router.get(
+    "/api/admin/mcp/index-jobs/{job_id}/failures",
+    response_model=McpIndexFailureListResponse,
+)
+def list_mcp_index_job_failures(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+    page: int = 1,
+    size: int = 100,
+) -> McpIndexFailureListResponse:
+    items, total = mcp_index_job_service.list_job_failures(
+        source_job_id=job_id,
+        requester_id=current_user.id,
+        requester_is_superadmin=current_user.role == "superadmin",
+        page=page,
+        size=size,
+    )
+    return McpIndexFailureListResponse(
+        items=[_to_failure_item(item) for item in items],
+        total=total,
+        page=max(1, page),
+        size=max(1, min(size, 500)),
+    )
+
+
+@router.post(
+    "/api/admin/mcp/index-jobs/{job_id}/retry-failures/by-paths",
+    response_model=McpIndexJobItem,
+)
+def retry_mcp_index_job_failures_by_paths(
+    job_id: str,
+    body: RetryJobFailurePathsRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> McpIndexJobItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = mcp_index_job_service.retry_job_failure_paths(
+        source_job_id=job_id,
+        user_id=current_user.id,
+        paths=body.paths,
+    )
+    return _to_job_item(item)
+
+
+@router.post(
+    "/api/admin/mcp/index-jobs/retry-failures",
+    response_model=RetryFailedJobsResponse,
+)
+def retry_all_failed_mcp_index_jobs(
+    body: RetryFailedJobsRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> RetryFailedJobsResponse:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    items = mcp_index_job_service.retry_all_failed_jobs(
+        user_id=current_user.id,
+        workspace=_normalize_optional(body.workspace),
+    )
+    return RetryFailedJobsResponse(items=[_to_job_item(item) for item in items])
 
 
 @router.post("/api/mcp/tool-call", response_model=McpToolCallResponse)
@@ -659,4 +767,15 @@ def _to_job_item(item) -> McpIndexJobItem:
         error_message=item.error_message,
         created_at=item.created_at,
         updated_at=item.updated_at,
+    )
+
+
+def _to_failure_item(item) -> McpIndexFailureItem:
+    return McpIndexFailureItem(
+        job_id=item.job_id,
+        workspace=item.workspace,
+        path=item.path,
+        reason=item.reason,
+        retry_count=item.retry_count,
+        created_at=item.created_at,
     )
