@@ -42,13 +42,6 @@ class McpToolCallResponse(BaseModel):
     data: dict[str, Any] | list[dict[str, Any]] | str | list[str] | None = None
 
 
-class McpBoundRpcRequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: int | str | None = None
-    method: str
-    params: dict[str, Any] = Field(default_factory=dict)
-
-
 @router.get("/api/mcp/auth/info", response_model=McpAuthInfoResponse)
 def get_mcp_auth_info(
     request: Request,
@@ -212,110 +205,9 @@ def mcp_tool_call_bound(
         current_user=current_user,
         tool=body.tool,
         arguments=arguments,
+        bound_workspace=workspace,
     )
     return McpToolCallResponse(mode="bound", workspace=workspace, data=data)
-
-
-@router.post("/mcp/{workspace}")
-def mcp_bound_rpc(
-    workspace: str,
-    body: McpBoundRpcRequest,
-    current_user: AuthUser = Depends(get_current_mcp_user),
-) -> dict[str, Any]:
-    _ensure_mcp_enabled()
-    _assert_workspace_access(current_user, workspace)
-    if body.jsonrpc != "2.0":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.id,
-            "error": {"code": -32600, "message": "invalid jsonrpc version"},
-        }
-
-    if body.method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {
-                    "name": "jework-mcp-bound",
-                    "version": "0.2.2",
-                },
-            },
-        }
-
-    if body.method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.id,
-            "result": {
-                "tools": _bound_tools_schema(workspace),
-            },
-        }
-
-    if body.method == "tools/call":
-        name = _normalize_optional(body.params.get("name"))
-        if not name:
-            return {
-                "jsonrpc": "2.0",
-                "id": body.id,
-                "error": {"code": -32602, "message": "tool name is required"},
-            }
-
-        arguments = body.params.get("arguments")
-        if not isinstance(arguments, dict):
-            arguments = {}
-        incoming_workspace = arguments.get("workspace")
-        if incoming_workspace is not None and str(incoming_workspace) != workspace:
-            return {
-                "jsonrpc": "2.0",
-                "id": body.id,
-                "error": {
-                    "code": -32602,
-                    "message": "workspace argument mismatches bound workspace",
-                },
-            }
-        arguments["workspace"] = workspace
-        try:
-            result = execute_mcp_tool(
-                current_user=current_user,
-                tool=name,
-                arguments=arguments,
-            )
-        except AppError as exc:
-            return {
-                "jsonrpc": "2.0",
-                "id": body.id,
-                "result": {
-                    "isError": True,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{exc.code}: {exc.message}",
-                        }
-                    ],
-                },
-            }
-
-        return {
-            "jsonrpc": "2.0",
-            "id": body.id,
-            "result": {
-                "isError": False,
-                "content": [{"type": "text", "text": str(result)}],
-                "structuredContent": result,
-            },
-        }
-
-    return {
-        "jsonrpc": "2.0",
-        "id": body.id,
-        "error": {
-            "code": -32601,
-            "message": f"unsupported method: {body.method}",
-        },
-    }
 
 
 def execute_mcp_tool(
@@ -323,6 +215,7 @@ def execute_mcp_tool(
     current_user: AuthUser,
     tool: str,
     arguments: dict[str, Any],
+    bound_workspace: str | None = None,
 ) -> Any:
     started = time.perf_counter()
     workspace_for_audit: str | None = None
@@ -330,7 +223,7 @@ def execute_mcp_tool(
     status = "ok"
     try:
         if tool == "list_workspaces":
-            workspace = _normalize_optional(arguments.get("workspace"))
+            workspace = bound_workspace or _normalize_optional(arguments.get("workspace"))
             if workspace:
                 _assert_workspace_access(current_user, workspace)
                 detail_items = workspace_service.list_workspaces(
@@ -362,7 +255,11 @@ def execute_mcp_tool(
             }
 
         if tool == "list_files":
-            workspace = _required_workspace(current_user, arguments)
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
             workspace_for_audit = workspace
             path = _normalize_optional(arguments.get("path")) or "."
             depth = _int_value(arguments.get("depth"), default=2, min_value=0, max_value=8)
@@ -371,7 +268,11 @@ def execute_mcp_tool(
             return _list_files(workspace, path=path, depth=depth, include_hidden=include_hidden)
 
         if tool == "read_file":
-            workspace = _required_workspace(current_user, arguments)
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
             workspace_for_audit = workspace
             path = _normalize_optional(arguments.get("path"))
             if not path:
@@ -386,7 +287,11 @@ def execute_mcp_tool(
             return _read_file(workspace, path=path, start_line=start_line, end_line=end_line)
 
         if tool == "grep_files":
-            workspace = _required_workspace(current_user, arguments)
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
             workspace_for_audit = workspace
             pattern = _normalize_optional(arguments.get("pattern"))
             if not pattern:
@@ -401,7 +306,11 @@ def execute_mcp_tool(
             return _grep_files(workspace, pattern=pattern, glob_pattern=glob_pattern, top_k=top_k)
 
         if tool in {"semantic_search", "hybrid_search"}:
-            workspace = _required_workspace(current_user, arguments)
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
             workspace_for_audit = workspace
             query = _normalize_optional(arguments.get("query"))
             if not query:
@@ -453,8 +362,26 @@ def execute_mcp_tool(
         )
 
 
-def _required_workspace(current_user: AuthUser, arguments: dict[str, Any]) -> str:
+def _required_workspace(
+    current_user: AuthUser,
+    arguments: dict[str, Any],
+    *,
+    bound_workspace: str | None = None,
+) -> str:
     workspace = _normalize_optional(arguments.get("workspace"))
+    if bound_workspace:
+        # 绑定入口下，workspace 以路径绑定值为准；若调用方显式传入且不一致则拒绝。
+        if workspace and workspace != bound_workspace:
+            raise AppError(
+                code="MCP_WORKSPACE_MISMATCH",
+                message="workspace argument mismatches bound workspace",
+                details={
+                    "workspace": bound_workspace,
+                    "argument_workspace": workspace,
+                },
+                status_code=400,
+            )
+        workspace = bound_workspace
     if not workspace:
         raise AppError(
             code="MCP_TOOL_INVALID_ARGUMENT",
@@ -645,80 +572,6 @@ def _semantic_fallback(workspace: str, *, query: str, top_k: int) -> dict[str, A
             )
     hits.sort(key=lambda row: (-int(row["score"]), str(row["path"])))
     return {"workspace": workspace, "hits": hits[:top_k]}
-
-
-def _bound_tools_schema(workspace: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "list_workspaces",
-            "description": "仅返回当前绑定 workspace",
-            "inputSchema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "list_files",
-            "description": "列出工作空间目录中的文件",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "depth": {"type": "integer"},
-                    "include_hidden": {"type": "boolean"},
-                },
-            },
-        },
-        {
-            "name": "read_file",
-            "description": "按行读取文件内容",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "end_line": {"type": "integer"},
-                },
-                "required": ["path"],
-            },
-        },
-        {
-            "name": "grep_files",
-            "description": "关键词/正则查找文件片段",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "glob": {"type": "string"},
-                    "top_k": {"type": "integer"},
-                },
-                "required": ["pattern"],
-            },
-        },
-        {
-            "name": "semantic_search",
-            "description": "向量语义检索（代码与文档）",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer"},
-                },
-                "required": ["query"],
-            },
-        },
-        {
-            "name": "hybrid_search",
-            "description": "向量召回 + 关键词重排",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer"},
-                },
-                "required": ["query"],
-            },
-        },
-    ]
-
-
 
 
 def _glob_match(path: str, pattern: str) -> bool:

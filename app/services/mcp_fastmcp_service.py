@@ -13,11 +13,20 @@ from app.core.errors import AppError, AuthRequiredError
 from app.services.auth_service import AuthUser, auth_service
 from app.services.mcp_settings_service import mcp_settings_service
 from app.services.mcp_token_service import mcp_token_service
+from app.services.mcp_prompt_templates import (
+    ANALYZE_CODEBASE_QUESTION,
+    TRACE_DOC_TO_CODE,
+    render_prompt_text,
+)
 
 logger = logging.getLogger(__name__)
 
 _CURRENT_MCP_USER: ContextVar[AuthUser | None] = ContextVar(
     "current_mcp_user",
+    default=None,
+)
+_CURRENT_BOUND_WORKSPACE: ContextVar[str | None] = ContextVar(
+    "current_bound_workspace",
     default=None,
 )
 
@@ -64,9 +73,14 @@ class _McpAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = _CURRENT_MCP_USER.set(current_user)
+        bound_workspace = request.scope.get("state", {}).get(
+            "mcp_bound_workspace",
+        )
+        token_workspace = _CURRENT_BOUND_WORKSPACE.set(bound_workspace)
         try:
             return await call_next(request)
         finally:
+            _CURRENT_BOUND_WORKSPACE.reset(token_workspace)
             _CURRENT_MCP_USER.reset(token)
 
 
@@ -79,10 +93,12 @@ def _require_current_user() -> AuthUser:
 
 def _safe_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     current_user = _require_current_user()
+    bound_workspace = _CURRENT_BOUND_WORKSPACE.get()
     data = execute_mcp_tool(
         current_user=current_user,
         tool=name,
         arguments=arguments,
+        bound_workspace=bound_workspace,
     )
     return data if isinstance(data, dict) else {"value": data}
 
@@ -116,7 +132,7 @@ def build_fastmcp_asgi_app():
         description="列出工作空间目录中的文件",
     )
     def list_files(
-        workspace: str,
+        workspace: str | None = None,
         path: str = ".",
         depth: int = 2,
         include_hidden: bool = False,
@@ -136,8 +152,8 @@ def build_fastmcp_asgi_app():
         description="按行读取文件内容",
     )
     def read_file(
-        workspace: str,
         path: str,
+        workspace: str | None = None,
         start_line: int = 1,
         end_line: int = 300,
     ) -> dict[str, Any]:
@@ -156,8 +172,8 @@ def build_fastmcp_asgi_app():
         description="关键词/正则查找文件片段",
     )
     def grep_files(
-        workspace: str,
         pattern: str,
+        workspace: str | None = None,
         glob: str = "**/*",
         top_k: int = 20,
     ) -> dict[str, Any]:
@@ -176,8 +192,8 @@ def build_fastmcp_asgi_app():
         description="向量语义检索（代码与文档）",
     )
     def semantic_search(
-        workspace: str,
         query: str,
+        workspace: str | None = None,
         top_k: int = 8,
     ) -> dict[str, Any]:
         return _safe_tool_call(
@@ -194,8 +210,8 @@ def build_fastmcp_asgi_app():
         description="向量召回 + 关键词重排",
     )
     def hybrid_search(
-        workspace: str,
         query: str,
+        workspace: str | None = None,
         top_k: int = 8,
     ) -> dict[str, Any]:
         return _safe_tool_call(
@@ -203,6 +219,46 @@ def build_fastmcp_asgi_app():
             {
                 "workspace": workspace,
                 "query": query,
+                "top_k": top_k,
+            },
+        )
+
+    @mcp.prompt(
+        name=ANALYZE_CODEBASE_QUESTION.name,
+        description=ANALYZE_CODEBASE_QUESTION.description,
+    )
+    def analyze_codebase_question(
+        question: str,
+        workspace: str | None = None,
+        scope_hint: str = "",
+        top_k: int = 8,
+    ) -> str:
+        return render_prompt_text(
+            name=ANALYZE_CODEBASE_QUESTION.name,
+            arguments={
+                "workspace": workspace,
+                "question": question,
+                "scope_hint": scope_hint,
+                "top_k": top_k,
+            },
+        )
+
+    @mcp.prompt(
+        name=TRACE_DOC_TO_CODE.name,
+        description=TRACE_DOC_TO_CODE.description,
+    )
+    def trace_doc_to_code(
+        doc_query: str,
+        workspace: str | None = None,
+        doc_path_hint: str = "",
+        top_k: int = 10,
+    ) -> str:
+        return render_prompt_text(
+            name=TRACE_DOC_TO_CODE.name,
+            arguments={
+                "workspace": workspace,
+                "doc_query": doc_query,
+                "doc_path_hint": doc_path_hint,
                 "top_k": top_k,
             },
         )

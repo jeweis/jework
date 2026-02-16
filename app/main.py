@@ -87,6 +87,27 @@ if _fastmcp_app is not None:
     app.mount("/mcp", _fastmcp_app)
 
 
+def _bind_workspace_from_mcp_path(request: Request, path: str) -> bool:
+    """识别 /mcp/{workspace} 绑定入口并注入上下文。
+
+    返回 True 表示该路径已按绑定入口处理，并已完成重写。
+    """
+    base = "/mcp"
+    if not path.startswith(f"{base}/"):
+        return False
+    suffix = path[len(base) + 1 :]
+    if not suffix:
+        return False
+    # 仅在单段路径下视为 workspace 绑定，例如 /mcp/test-ai-doc。
+    if "/" in suffix:
+        return False
+
+    request.scope.setdefault("state", {})
+    request.scope["state"]["mcp_bound_workspace"] = suffix
+    request.scope["path"] = "/mcp/"
+    return True
+
+
 @app.middleware("http")
 async def _rewrite_dynamic_mcp_base_path(
     request: Request,
@@ -106,6 +127,8 @@ async def _rewrite_dynamic_mcp_base_path(
     if incoming_path == "/mcp":
         request.scope["path"] = "/mcp/"
         return await call_next(request)
+    if _bind_workspace_from_mcp_path(request, incoming_path):
+        return await call_next(request)
 
     if configured_base_path != "/mcp":
         base = configured_base_path.rstrip("/") or "/"
@@ -115,7 +138,13 @@ async def _rewrite_dynamic_mcp_base_path(
             if suffix in {"", "/"}:
                 request.scope["path"] = "/mcp/"
             else:
-                request.scope["path"] = f"/mcp{suffix}"
+                maybe_workspace = suffix.lstrip("/")
+                if "/" not in maybe_workspace and maybe_workspace:
+                    request.scope.setdefault("state", {})
+                    request.scope["state"]["mcp_bound_workspace"] = maybe_workspace
+                    request.scope["path"] = "/mcp/"
+                else:
+                    request.scope["path"] = f"/mcp{suffix}"
     return await call_next(request)
 
 
