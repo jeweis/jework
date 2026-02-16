@@ -50,6 +50,8 @@ from app.services.feishu_auth_service import feishu_auth_service
 from app.services.feishu_settings_service import feishu_settings_service
 from app.services.llm_config_service import llm_config_service
 from app.services.markdown_service import markdown_service
+from app.services.mcp_index_job_service import mcp_index_job_service
+from app.services.mcp_settings_service import mcp_settings_service
 from app.services.session_service import session_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
@@ -532,6 +534,20 @@ def pull_workspace_git(
 ) -> WorkspacePullResponse:
     _require_workspace_access(workspace, current_user)
     result = workspace_service.pull_workspace(workspace)
+    # Pull 成功后触发增量索引，让向量库尽快与最新代码对齐。
+    try:
+        if result.changed and mcp_settings_service.get_settings().mcp_enabled:
+            mcp_index_job_service.create_job(
+                user_id=current_user.id,
+                workspace=workspace,
+                mode="incremental",
+            )
+    except Exception as exc:
+        logger.warning(
+            "auto incremental index schedule failed workspace=%s reason=%s",
+            workspace,
+            exc,
+        )
     return WorkspacePullResponse(
         workspace=result.workspace,
         before_commit=result.before_commit,

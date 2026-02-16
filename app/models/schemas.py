@@ -164,6 +164,78 @@ class UpdateFeishuSettingsRequest(BaseModel):
     default_workspace_names: list[str] | None = None
 
 
+class McpAuthInfoResponse(BaseModel):
+    mcp_url: str
+    workspace_mcp_url_template: str
+    has_token: bool
+    token_hint: str | None = None
+    updated_at: str | None = None
+
+
+class McpResetTokenResponse(BaseModel):
+    token: str
+    token_hint: str
+    mcp_url: str
+    workspace_mcp_url_template: str
+    updated_at: str
+
+
+class McpSettingsItem(BaseModel):
+    mcp_enabled: bool
+    mcp_base_path: str
+    mcp_public_base_url: str | None = None
+    kb_enable_vector: bool
+    kb_chroma_dir: str
+    kb_vector_topk_default: int
+    kb_file_max_bytes: int
+    kb_read_max_lines: int
+    embedding_backend: str
+    embedding_base_url: str | None = None
+    embedding_model: str | None = None
+    embedding_batch_size: int
+    has_embedding_api_key: bool
+    editable_fields: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
+class UpdateMcpSettingsRequest(BaseModel):
+    mcp_enabled: bool | None = None
+    mcp_base_path: str | None = Field(default=None, max_length=128)
+    mcp_public_base_url: str | None = Field(default=None, max_length=512)
+    kb_enable_vector: bool | None = None
+    kb_chroma_dir: str | None = Field(default=None, max_length=512)
+    kb_vector_topk_default: int | None = None
+    kb_file_max_bytes: int | None = None
+    kb_read_max_lines: int | None = None
+    embedding_backend: str | None = Field(default=None, max_length=64)
+    embedding_base_url: str | None = Field(default=None, max_length=512)
+    embedding_model: str | None = Field(default=None, max_length=256)
+    embedding_batch_size: int | None = None
+    embedding_api_key: str | None = Field(default=None, max_length=1024)
+    clear_embedding_api_key: bool | None = None
+
+
+class CreateMcpIndexJobRequest(BaseModel):
+    workspace: str
+    mode: str = Field(default="incremental")
+
+
+class McpIndexJobItem(BaseModel):
+    job_id: str
+    workspace: str
+    mode: str
+    status: str
+    percent: int
+    total_files: int
+    total_chunks: int
+    processed_chunks: int
+    failed_chunks: int
+    elapsed_ms: int
+    error_message: str | None = None
+    created_at: str
+    updated_at: str
+
+
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=6, max_length=128)

@@ -293,6 +293,32 @@ class AuthService:
                 feishu_open_id=row["feishu_open_id"],
             )
 
+    def get_user_by_id(self, user_id: int) -> AuthUser:
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, username, role, created_at,
+                       display_name, avatar_url, feishu_union_id, feishu_open_id
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise AuthRequiredError()
+            return AuthUser(
+                id=row["id"],
+                username=row["username"],
+                role=row["role"],
+                created_at=row["created_at"],
+                display_name=row["display_name"],
+                avatar_url=row["avatar_url"],
+                feishu_union_id=row["feishu_union_id"],
+                feishu_open_id=row["feishu_open_id"],
+            )
+
     def create_user(
         self,
         current_user: AuthUser,
