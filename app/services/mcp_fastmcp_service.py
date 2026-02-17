@@ -32,6 +32,34 @@ _CURRENT_BOUND_WORKSPACE: ContextVar[str | None] = ContextVar(
 )
 
 
+# 工具参数中的 workspace 统一说明，避免多处重复且保证描述一致。
+_WORKSPACE_PARAM_DESCRIPTION = (
+    "目标工作空间名称。"
+    "在 /mcp（多工作空间入口）下通常必填；"
+    "在 /mcp/{workspace}（绑定入口）下可省略，若传入必须与绑定工作空间一致。"
+)
+
+# 服务级说明：告诉客户端本服务的能力与调用约束。
+_SERVER_INSTRUCTIONS = """
+你当前连接的是 Jework 提供的代码知识库 MCP 服务。
+该服务面向已接入 Jework 的工作空间代码库（包括代码与文档），用于连接已有的代码库内容。
+服务用途是读取与检索工作空间内容，用于理解实现逻辑、配置与文档；不提供写入或代码修改能力。
+
+使用规则：
+1. 先调用 list_workspaces 获取可访问工作空间及备注（name + note）。
+2. 当前入口可能是多工作空间(/mcp)或绑定工作空间(/mcp/{workspace})。
+3. 在多工作空间入口，调用 list_files/read_file/grep_files/semantic_search/hybrid_search 时应显式传 workspace。
+4. 在绑定入口，工具默认作用于绑定工作空间；workspace 参数可省略，若传入必须一致。
+5. semantic_search 若向量不可用，建议回退 grep_files + read_file。
+
+你可以完成的典型任务：
+- 快速了解某个模块/目录做什么（list_files + read_file）
+- 根据关键词定位实现位置（grep_files）
+- 根据自然语言问题做跨文件语义召回（semantic_search / hybrid_search）
+- 追溯文档描述对应的代码实现与配置来源（grep_files + read_file + semantic_search）
+""".strip()
+
+
 class _McpAuthMiddleware(BaseHTTPMiddleware):
     """为 FastMCP 请求注入 Jework MCP 鉴权上下文。"""
 
@@ -116,11 +144,18 @@ def build_fastmcp_asgi_app():
         logger.warning("fastmcp is unavailable, fallback disabled: %s", exc)
         return None
 
-    mcp = FastMCP(name="jework-mcp")
+    mcp = FastMCP(
+        name="jework-mcp",
+        instructions=_SERVER_INSTRUCTIONS,
+    )
 
     @mcp.tool(
         name="list_workspaces",
-        description="列出当前 token 可访问的工作空间",
+        description=(
+            "列出当前可访问的工作空间（name + note）。"
+            "在多工作空间模式下返回全部可访问 workspace；"
+            "在绑定工作空间模式下仅返回当前绑定 workspace，并附带绑定模式提示。"
+        ),
     )
     def list_workspaces(workspace: str | None = None) -> dict[str, Any]:
         arguments: dict[str, Any] = {}
@@ -130,15 +165,16 @@ def build_fastmcp_asgi_app():
 
     @mcp.tool(
         name="list_files",
-        description="列出工作空间目录中的文件",
+        description=(
+            "列出目标工作空间下某个目录的文件树。"
+            "适合先做目录探测，再决定 read_file/grep_files 的目标路径。"
+        ),
     )
     def list_files(
         workspace: Annotated[
             str | None,
             Field(
-                description=(
-                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
-                ),
+                description=_WORKSPACE_PARAM_DESCRIPTION,
             ),
         ] = None,
         path: Annotated[
@@ -172,7 +208,10 @@ def build_fastmcp_asgi_app():
 
     @mcp.tool(
         name="read_file",
-        description="按行读取文件内容",
+        description=(
+            "按行读取文件片段，用于查看实现细节、配置内容和文档原文。"
+            "返回内容包含行号范围，便于后续精确引用。"
+        ),
     )
     def read_file(
         path: Annotated[
@@ -184,9 +223,7 @@ def build_fastmcp_asgi_app():
         workspace: Annotated[
             str | None,
             Field(
-                description=(
-                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
-                ),
+                description=_WORKSPACE_PARAM_DESCRIPTION,
             ),
         ] = None,
         start_line: Annotated[
@@ -210,7 +247,10 @@ def build_fastmcp_asgi_app():
 
     @mcp.tool(
         name="grep_files",
-        description="关键词/正则查找文件片段",
+        description=(
+            "基于关键词或正则在文件中查找片段。"
+            "适合做快速定位，再配合 read_file 读取上下文。"
+        ),
     )
     def grep_files(
         pattern: Annotated[
@@ -222,9 +262,7 @@ def build_fastmcp_asgi_app():
         workspace: Annotated[
             str | None,
             Field(
-                description=(
-                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
-                ),
+                description=_WORKSPACE_PARAM_DESCRIPTION,
             ),
         ] = None,
         glob: Annotated[
@@ -252,7 +290,10 @@ def build_fastmcp_asgi_app():
 
     @mcp.tool(
         name="semantic_search",
-        description="向量语义检索（代码与文档）",
+        description=(
+            "向量语义检索（代码与文档）。"
+            "当问题是自然语言描述时优先使用，适合跨文件语义召回。"
+        ),
     )
     def semantic_search(
         query: Annotated[
@@ -262,9 +303,7 @@ def build_fastmcp_asgi_app():
         workspace: Annotated[
             str | None,
             Field(
-                description=(
-                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
-                ),
+                description=_WORKSPACE_PARAM_DESCRIPTION,
             ),
         ] = None,
         top_k: Annotated[
@@ -283,7 +322,10 @@ def build_fastmcp_asgi_app():
 
     @mcp.tool(
         name="hybrid_search",
-        description="向量召回 + 关键词重排",
+        description=(
+            "混合检索：向量召回 + 关键词重排。"
+            "当语义检索结果不稳定时，可用该工具提升精确命中率。"
+        ),
     )
     def hybrid_search(
         query: Annotated[
@@ -293,9 +335,7 @@ def build_fastmcp_asgi_app():
         workspace: Annotated[
             str | None,
             Field(
-                description=(
-                    "目标工作空间名称。绑定入口(/mcp/{workspace})可省略。"
-                ),
+                description=_WORKSPACE_PARAM_DESCRIPTION,
             ),
         ] = None,
         top_k: Annotated[
