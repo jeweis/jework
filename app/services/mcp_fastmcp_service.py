@@ -81,10 +81,25 @@ class _McpAuthMiddleware(BaseHTTPMiddleware):
                     },
                 )
 
-            authorization = request.headers.get("Authorization")
-            if not authorization or not authorization.startswith("Bearer "):
+            # 优先自定义头 Jework-Authorization，其次兼容标准头 Authorization。
+            authorization = request.headers.get(
+                "Jework-Authorization",
+            ) or request.headers.get("Authorization")
+            if not authorization:
                 raise AuthRequiredError()
-            raw_token = authorization[len("Bearer ") :].strip()
+
+            header_value = authorization.strip()
+            if not header_value:
+                raise AuthRequiredError()
+
+            # 兼容两种写法：
+            # 1) 标准写法：Authorization: Bearer <token>
+            # 2) 简写兼容：Authorization: <token>
+            if header_value.lower().startswith("bearer "):
+                raw_token = header_value[len("Bearer ") :].strip()
+            else:
+                raw_token = header_value
+
             if not raw_token:
                 raise AuthRequiredError()
             user_id = mcp_token_service.verify_token(raw_token)
