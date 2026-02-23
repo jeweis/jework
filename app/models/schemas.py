@@ -131,6 +131,7 @@ class UserResponse(BaseModel):
     display_name: str | None = None
     role: str
     created_at: str
+    has_local_password: bool = True
     accessible_workspaces: list[str] = Field(default_factory=list)
 
 
@@ -146,6 +147,14 @@ class FeishuStatusResponse(BaseModel):
 
 class FeishuLoginRequest(BaseModel):
     code: str = Field(min_length=1, max_length=2048)
+
+
+class SetLocalPasswordRequest(BaseModel):
+    password: str = Field(min_length=6, max_length=128)
+
+
+class AdminResetUserPasswordRequest(BaseModel):
+    password: str = Field(min_length=6, max_length=128)
 
 
 class FeishuSettingsItem(BaseModel):

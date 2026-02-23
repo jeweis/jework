@@ -1,3 +1,6 @@
+import pytest
+
+from app.core.errors import AuthInvalidCredentialsError, AuthRequiredError
 from app.services.auth_service import AuthUser, AuthService
 
 
@@ -18,6 +21,7 @@ def test_bootstrap_and_login(tmp_path):
 
     from_token = service.get_user_by_token(token)
     assert from_token.username == "admin"
+    assert from_token.has_local_password is True
 
 
 def test_superadmin_can_create_user(tmp_path):
@@ -30,6 +34,7 @@ def test_superadmin_can_create_user(tmp_path):
 
     assert isinstance(created, AuthUser)
     assert created.role == "user"
+    assert created.has_local_password is True
 
 
 def test_feishu_first_login_and_relogin_updates_profile(tmp_path):
@@ -46,6 +51,7 @@ def test_feishu_first_login_and_relogin_updates_profile(tmp_path):
     assert token1
     assert first1 is True
     assert user1.role == "user"
+    assert user1.has_local_password is False
     assert user1.display_name == "飞书张三"
     assert user1.feishu_union_id == "on_test_union_001"
 
@@ -58,6 +64,7 @@ def test_feishu_first_login_and_relogin_updates_profile(tmp_path):
     assert token2
     assert first2 is False
     assert user2.id == user1.id
+    assert user2.has_local_password is False
     assert user2.display_name == "飞书李四"
     assert user2.feishu_open_id == "ou_test_open_002"
 
@@ -77,3 +84,54 @@ def test_feishu_first_login_assigns_default_workspaces(tmp_path):
 
     assert first_login is True
     assert service.get_accessible_workspaces(user) == ["alpha", "beta"]
+
+
+def test_set_local_password_enables_password_login_and_revokes_tokens(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    old_token, feishu_user, _ = service.login_by_feishu(
+        union_id="on_set_password_001",
+        open_id="ou_set_password_001",
+        name="飞书用户A",
+        avatar_url=None,
+    )
+    assert feishu_user.has_local_password is False
+
+    service.set_local_password(
+        current_user=feishu_user,
+        new_password="newpass123",
+    )
+
+    with pytest.raises(AuthRequiredError):
+        service.get_user_by_token(old_token)
+
+    new_token, user_after_set = service.login(feishu_user.username, "newpass123")
+    assert new_token
+    assert user_after_set.has_local_password is True
+
+
+def test_superadmin_can_reset_user_password_and_revoke_user_tokens(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    admin = service.bootstrap_superadmin("admin", "password123")
+    created = service.create_user(admin, "user02", "oldpass123")
+    old_token, _ = service.login("user02", "oldpass123")
+
+    service.admin_reset_user_password(
+        current_user=admin,
+        user_id=created.id,
+        new_password="newpass123",
+    )
+
+    with pytest.raises(AuthRequiredError):
+        service.get_user_by_token(old_token)
+
+    with pytest.raises(AuthInvalidCredentialsError):
+        service.login("user02", "oldpass123")
+
+    _, user_after_reset = service.login("user02", "newpass123")
+    assert user_after_reset.has_local_password is True

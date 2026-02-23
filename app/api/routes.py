@@ -8,8 +8,10 @@ from fastapi.responses import StreamingResponse
 from app.api.deps import get_current_user
 from app.core.errors import AuthForbiddenError
 from app.models.schemas import (
+    AdminResetUserPasswordRequest,
     BootstrapRequest,
     BootstrapStatusResponse,
+    SetLocalPasswordRequest,
     FeishuLoginRequest,
     FeishuSettingsItem,
     FeishuStatusResponse,
@@ -76,6 +78,7 @@ def bootstrap(body: BootstrapRequest) -> UserResponse:
         display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
+        has_local_password=user.has_local_password,
         accessible_workspaces=[],
     )
 
@@ -92,6 +95,7 @@ def login(body: LoginRequest) -> LoginResponse:
             display_name=user.display_name,
             role=user.role,
             created_at=user.created_at,
+            has_local_password=user.has_local_password,
             accessible_workspaces=accessible,
         ),
     )
@@ -132,6 +136,7 @@ def feishu_login(body: FeishuLoginRequest) -> LoginResponse:
             display_name=user.display_name,
             role=user.role,
             created_at=user.created_at,
+            has_local_password=user.has_local_password,
             accessible_workspaces=accessible,
         ),
     )
@@ -146,8 +151,21 @@ def get_me(current_user: AuthUser = Depends(get_current_user)) -> UserResponse:
         display_name=current_user.display_name,
         role=current_user.role,
         created_at=current_user.created_at,
+        has_local_password=current_user.has_local_password,
         accessible_workspaces=accessible,
     )
+
+
+@router.post("/auth/password/set")
+def set_local_password(
+    body: SetLocalPasswordRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, str]:
+    auth_service.set_local_password(
+        current_user=current_user,
+        new_password=body.password,
+    )
+    return {"status": "ok"}
 
 
 @router.get("/users", response_model=UserListResponse)
@@ -161,6 +179,7 @@ def list_users(current_user: AuthUser = Depends(get_current_user)) -> UserListRe
                 display_name=user.display_name,
                 role=user.role,
                 created_at=user.created_at,
+                has_local_password=user.has_local_password,
                 accessible_workspaces=user.accessible_workspaces or [],
             )
             for user in users
@@ -224,6 +243,7 @@ def create_user(
         display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
+        has_local_password=user.has_local_password,
         accessible_workspaces=user.accessible_workspaces or [],
     )
 
@@ -252,8 +272,23 @@ def update_user_workspaces(
         display_name=target.display_name,
         role=target.role,
         created_at=target.created_at,
+        has_local_password=target.has_local_password,
         accessible_workspaces=[] if target.role == "superadmin" else accessible,
     )
+
+
+@router.post("/admin/users/{user_id}/password/reset")
+def admin_reset_user_password(
+    user_id: int,
+    body: AdminResetUserPasswordRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, str]:
+    auth_service.admin_reset_user_password(
+        current_user=current_user,
+        user_id=user_id,
+        new_password=body.password,
+    )
+    return {"status": "ok"}
 
 
 @router.get("/llm-configs", response_model=LlmConfigListResponse)
