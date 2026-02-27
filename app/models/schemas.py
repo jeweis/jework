@@ -177,6 +177,7 @@ class McpAuthInfoResponse(BaseModel):
     mcp_url: str
     workspace_mcp_url_template: str
     has_token: bool
+    token: str | None = None
     token_hint: str | None = None
     updated_at: str | None = None
 

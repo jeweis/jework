@@ -54,11 +54,13 @@ def get_mcp_auth_info(
     current_user: AuthUser = Depends(get_current_user),
 ) -> McpAuthInfoResponse:
     info = mcp_token_service.get_info(current_user.id)
+    token = mcp_token_service.get_token(current_user.id)
     mcp_url, template = mcp_settings_service.build_mcp_url(_request_base_url(request))
     return McpAuthInfoResponse(
         mcp_url=mcp_url,
         workspace_mcp_url_template=template,
         has_token=info.has_token,
+        token=token,
         token_hint=info.token_hint,
         updated_at=info.updated_at,
     )
