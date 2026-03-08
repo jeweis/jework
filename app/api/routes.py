@@ -1126,6 +1126,10 @@ async def _execute_session_run(
         )
     except Exception as exc:
         reason = str(exc)
+        if isinstance(exc, AppError) and isinstance(exc.details, dict):
+            detail_reason = exc.details.get("reason")
+            if isinstance(detail_reason, str) and detail_reason.strip():
+                reason = detail_reason.strip()
         logger.exception(
             "Session run failed: session_id=%s run_id=%s user_id=%s",
             session_id,
