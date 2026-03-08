@@ -1203,6 +1203,10 @@ async def send_message(
             + [
                 f"mcp__{server_name}__create_project"
                 for server_name in personal_mcp_server_names
+            ]
+            + [
+                f"mcp__{server_name}__get_current_workspace_path"
+                for server_name in personal_mcp_server_names
             ],
         )
         workspace_mcp_servers: dict[str, dict[str, object]] = {}

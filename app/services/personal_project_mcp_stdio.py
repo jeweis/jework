@@ -82,6 +82,19 @@ def _create_project(user_id: int, *, name: str, initialize_readme: bool) -> dict
     }
 
 
+def _get_current_workspace_path(user_id: int) -> dict[str, Any]:
+    current = Path.cwd().resolve()
+    main_root = workspace_service.get_personal_main_agent_workspace_root(user_id).resolve()
+    project_root = (main_root / "project").resolve()
+    return {
+        "cwd": str(current),
+        "main_workspace_root": str(main_root),
+        "project_root": str(project_root),
+        "cwd_in_main_workspace": (current == main_root or main_root in current.parents),
+        "cwd_in_project_root": (current == project_root or project_root in current.parents),
+    }
+
+
 def _build_mcp():
     from fastmcp import FastMCP
 
@@ -114,6 +127,13 @@ def _build_mcp():
             name=name,
             initialize_readme=bool(initialize_readme),
         )
+
+    @mcp.tool(
+        name="get_current_workspace_path",
+        description="返回当前会话工作目录及个人工作台主目录信息。",
+    )
+    def get_current_workspace_path() -> dict[str, Any]:
+        return _get_current_workspace_path(user_id)
 
     return mcp
 

@@ -21,6 +21,7 @@ DEFAULT_PERSONAL_WRITE_TOOLS = [
     "WebFetch",
 ]
 MAX_STDERR_LINES = 40
+WRITE_LIKE_TOOL_NAMES = {"write", "edit", "multiedit", "notebookedit"}
 
 
 def _resolve_agent_max_turns() -> int:
@@ -70,7 +71,20 @@ def _extract_candidate_paths(payload: Any) -> list[str]:
     if isinstance(payload, dict):
         for key, value in payload.items():
             normalized_key = str(key).lower()
-            if normalized_key in {"path", "file_path", "filepath", "target_path"}:
+            if normalized_key in {
+                "path",
+                "file_path",
+                "filepath",
+                "target_path",
+                "targetfile",
+                "target_file",
+                "file",
+                "filename",
+                "source_path",
+                "destination_path",
+                "notebook_path",
+                "new_path",
+            }:
                 if isinstance(value, str) and value.strip():
                     candidates.append(value.strip())
                 continue
@@ -207,8 +221,19 @@ async def stream_agent_response(
             # 个人可写模式：强制所有路径型参数留在 workspace_root 内。
             if not enable_workspace_write_guard:
                 return PermissionResultAllow()
+            normalized_tool_name = str(tool_name).strip().lower()
+            candidates = _extract_candidate_paths(tool_input)
+            # 写类工具必须显式提供路径参数；否则拒绝，避免“漏提取字段即放行”。
+            if normalized_tool_name in WRITE_LIKE_TOOL_NAMES and not candidates:
+                return PermissionResultDeny(
+                    message=(
+                        "Write-like tool requires explicit path arguments within workspace. "
+                        f"tool={tool_name}"
+                    ),
+                    interrupt=False,
+                )
             blocked = False
-            for candidate in _extract_candidate_paths(tool_input):
+            for candidate in candidates:
                 if not _is_path_in_workspace(candidate, workspace_root):
                     blocked = True
                     break
