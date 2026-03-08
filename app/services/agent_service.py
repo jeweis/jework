@@ -120,6 +120,43 @@ def _resolve_cli_path() -> str:
     return "claude"
 
 
+def _find_cli_with_runtime_env(merged_env: dict[str, str]) -> str | None:
+    """
+    按 claude-agent-sdk 的习惯查找 Claude CLI：
+    1) 显式配置 CLAUDE_CODE_CLI_PATH
+    2) PATH 中的 claude
+    3) 常见默认安装位置
+    """
+    runtime_cli = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip()
+    if runtime_cli:
+        has_separator = os.sep in runtime_cli or (
+            os.altsep is not None and os.altsep in runtime_cli
+        )
+        if has_separator:
+            path = Path(runtime_cli)
+            return str(path) if path.exists() and path.is_file() else None
+        resolved = shutil.which(runtime_cli, path=merged_env.get("PATH"))
+        return resolved
+
+    detected = shutil.which("claude", path=merged_env.get("PATH"))
+    if detected:
+        return detected
+
+    home = Path((merged_env.get("HOME") or str(Path.home())).strip() or str(Path.home()))
+    candidates = [
+        home / ".npm-global/bin/claude",
+        Path("/usr/local/bin/claude"),
+        home / ".local/bin/claude",
+        home / "node_modules/.bin/claude",
+        home / ".yarn/bin/claude",
+        home / ".claude/local/claude",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def _parse_semver(version_text: str) -> tuple[int, int, int] | None:
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
     if not match:
@@ -156,26 +193,14 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
         raise AgentInvocationError(f"Agent working directory not found: {cwd_path}")
 
     merged_env = _merged_runtime_env(env)
-    runtime_cli = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip()
-    cli = runtime_cli or _resolve_cli_path()
-    if cli == "claude":
-        detected = shutil.which("claude", path=merged_env.get("PATH"))
-        if not detected:
-            raise AgentInvocationError(
-                "Claude CLI not found in PATH. "
-                "Install it or set CLAUDE_CODE_CLI_PATH."
-            )
-    else:
-        # 兼容显式配置为“命令名”而非绝对路径的场景（例如 CLAUDE_CODE_CLI_PATH=claude-beta）。
-        has_separator = os.sep in cli or (os.altsep is not None and os.altsep in cli)
-        if has_separator:
-            if not Path(cli).exists():
-                raise AgentInvocationError(f"CLAUDE_CODE_CLI_PATH not found: {cli}")
-        else:
-            resolved_cli = shutil.which(cli, path=merged_env.get("PATH"))
-            if not resolved_cli:
-                raise AgentInvocationError(f"CLAUDE_CODE_CLI_PATH not found in PATH: {cli}")
-            cli = resolved_cli
+    cli = _find_cli_with_runtime_env(merged_env)
+    if not cli:
+        configured = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip() or "<empty>"
+        raise AgentInvocationError(
+            "Claude CLI not found. "
+            "Install it or set CLAUDE_CODE_CLI_PATH. "
+            f"CLAUDE_CODE_CLI_PATH={configured}"
+        )
 
     try:
         version_process = subprocess.run(
