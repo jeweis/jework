@@ -127,16 +127,24 @@ def _parse_semver(version_text: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-def _has_anthropic_auth(env: dict[str, str] | None) -> bool:
+def _has_runtime_env_auth(env: dict[str, str] | None) -> bool:
     candidates = (
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
     )
+    runtime_env = env or {}
+    return any(bool(runtime_env.get(key, "").strip()) for key in candidates)
+
+
+def _merged_runtime_env(env: dict[str, str] | None) -> dict[str, str]:
+    """
+    合并运行时环境变量（进程环境 + LLM 配置注入环境）。
+    """
     merged: dict[str, str] = {}
     merged.update(os.environ)
     if env:
         merged.update(env)
-    return any(bool(merged.get(key, "").strip()) for key in candidates)
+    return merged
 
 
 def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict[str, str]:
@@ -147,16 +155,27 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
     if not cwd_path.exists() or not cwd_path.is_dir():
         raise AgentInvocationError(f"Agent working directory not found: {cwd_path}")
 
-    cli = _resolve_cli_path()
+    merged_env = _merged_runtime_env(env)
+    runtime_cli = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip()
+    cli = runtime_cli or _resolve_cli_path()
     if cli == "claude":
-        detected = shutil.which("claude")
+        detected = shutil.which("claude", path=merged_env.get("PATH"))
         if not detected:
             raise AgentInvocationError(
                 "Claude CLI not found in PATH. "
                 "Install it or set CLAUDE_CODE_CLI_PATH."
             )
-    elif not Path(cli).exists():
-        raise AgentInvocationError(f"CLAUDE_CODE_CLI_PATH not found: {cli}")
+    else:
+        # 兼容显式配置为“命令名”而非绝对路径的场景（例如 CLAUDE_CODE_CLI_PATH=claude-beta）。
+        has_separator = os.sep in cli or (os.altsep is not None and os.altsep in cli)
+        if has_separator:
+            if not Path(cli).exists():
+                raise AgentInvocationError(f"CLAUDE_CODE_CLI_PATH not found: {cli}")
+        else:
+            resolved_cli = shutil.which(cli, path=merged_env.get("PATH"))
+            if not resolved_cli:
+                raise AgentInvocationError(f"CLAUDE_CODE_CLI_PATH not found in PATH: {cli}")
+            cli = resolved_cli
 
     try:
         version_process = subprocess.run(
@@ -166,6 +185,7 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
             text=True,
             timeout=5,
             check=False,
+            env=merged_env,
         )
     except Exception as exc:
         raise AgentInvocationError(f"Claude CLI preflight failed: {exc}") from exc
@@ -186,9 +206,11 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
             f"required>={MIN_CLAUDE_CLI_VERSION[0]}.{MIN_CLAUDE_CLI_VERSION[1]}.{MIN_CLAUDE_CLI_VERSION[2]}"
         )
 
-    if not _has_anthropic_auth(env):
+    # Jework 强制要求使用“激活的 LLM 配置”提供鉴权信息，不允许依赖 Claude CLI 本地登录态。
+    has_env_auth = _has_runtime_env_auth(env)
+    if not has_env_auth:
         raise AgentInvocationError(
-            "Claude runtime auth is missing. "
+            "Claude runtime auth is missing from active LLM config. "
             "Set ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY) in active LLM config."
         )
 
@@ -196,7 +218,7 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
         "cli_path": cli,
         "cli_version": f"{parsed[0]}.{parsed[1]}.{parsed[2]}",
         "cwd": str(cwd_path),
-        "has_auth": "true",
+        "has_auth": "env",
     }
 
 

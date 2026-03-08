@@ -1165,6 +1165,19 @@ async def send_message(
 ) -> SessionRunResponse:
     session = session_service.get_session(session_id, user_id=current_user.id)
     runtime_env = llm_config_service.get_active_env()
+    runtime_auth = (
+        (runtime_env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
+        or (runtime_env.get("ANTHROPIC_API_KEY") or "").strip()
+    )
+    if not runtime_auth:
+        raise AppError(
+            code="LLM_CONFIG_AUTH_REQUIRED",
+            message=(
+                "Active LLM config auth token is required. "
+                "Please configure and activate ANTHROPIC_AUTH_TOKEN first."
+            ),
+            status_code=400,
+        )
     if session.scope == "personal_agent":
         bootstrap = personal_agent_service.ensure_main_agent_workspace(
             user_id=current_user.id,
