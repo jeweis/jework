@@ -2,9 +2,6 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 import logging
 import os
-import re
-import shutil
-import subprocess
 from typing import Any, Callable
 
 from app.core.errors import AgentInvocationError
@@ -24,7 +21,6 @@ DEFAULT_PERSONAL_WRITE_TOOLS = [
     "WebFetch",
 ]
 MAX_STDERR_LINES = 40
-MIN_CLAUDE_CLI_VERSION = (2, 0, 0)
 
 
 def _resolve_agent_max_turns() -> int:
@@ -106,64 +102,6 @@ async def _single_prompt_stream(prompt: str):
     }
 
 
-def _resolve_cli_path() -> str:
-    """
-    解析 Claude CLI 路径。
-
-    优先级：
-    1) 环境变量显式指定（与 SDK option 语义保持一致）；
-    2) PATH 中的 `claude`。
-    """
-    explicit = os.getenv("CLAUDE_CODE_CLI_PATH", "").strip()
-    if explicit:
-        return explicit
-    return "claude"
-
-
-def _find_cli_with_runtime_env(merged_env: dict[str, str]) -> str | None:
-    """
-    按 claude-agent-sdk 的习惯查找 Claude CLI：
-    1) 显式配置 CLAUDE_CODE_CLI_PATH
-    2) PATH 中的 claude
-    3) 常见默认安装位置
-    """
-    runtime_cli = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip()
-    if runtime_cli:
-        has_separator = os.sep in runtime_cli or (
-            os.altsep is not None and os.altsep in runtime_cli
-        )
-        if has_separator:
-            path = Path(runtime_cli)
-            return str(path) if path.exists() and path.is_file() else None
-        resolved = shutil.which(runtime_cli, path=merged_env.get("PATH"))
-        return resolved
-
-    detected = shutil.which("claude", path=merged_env.get("PATH"))
-    if detected:
-        return detected
-
-    home = Path((merged_env.get("HOME") or str(Path.home())).strip() or str(Path.home()))
-    candidates = [
-        home / ".npm-global/bin/claude",
-        Path("/usr/local/bin/claude"),
-        home / ".local/bin/claude",
-        home / "node_modules/.bin/claude",
-        home / ".yarn/bin/claude",
-        home / ".claude/local/claude",
-    ]
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            return str(candidate)
-    return None
-
-
-def _parse_semver(version_text: str) -> tuple[int, int, int] | None:
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
-    if not match:
-        return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
-
 def _has_runtime_env_auth(env: dict[str, str] | None) -> bool:
     candidates = (
         "ANTHROPIC_AUTH_TOKEN",
@@ -172,18 +110,6 @@ def _has_runtime_env_auth(env: dict[str, str] | None) -> bool:
     runtime_env = env or {}
     return any(bool(runtime_env.get(key, "").strip()) for key in candidates)
 
-
-def _merged_runtime_env(env: dict[str, str] | None) -> dict[str, str]:
-    """
-    合并运行时环境变量（进程环境 + LLM 配置注入环境）。
-    """
-    merged: dict[str, str] = {}
-    merged.update(os.environ)
-    if env:
-        merged.update(env)
-    return merged
-
-
 def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict[str, str]:
     """
     在调用 SDK 前做快速预检，尽早给出可读错误信息。
@@ -191,45 +117,6 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
     cwd_path = Path(cwd).resolve()
     if not cwd_path.exists() or not cwd_path.is_dir():
         raise AgentInvocationError(f"Agent working directory not found: {cwd_path}")
-
-    merged_env = _merged_runtime_env(env)
-    cli = _find_cli_with_runtime_env(merged_env)
-    if not cli:
-        configured = (merged_env.get("CLAUDE_CODE_CLI_PATH") or "").strip() or "<empty>"
-        raise AgentInvocationError(
-            "Claude CLI not found. "
-            "Install it or set CLAUDE_CODE_CLI_PATH. "
-            f"CLAUDE_CODE_CLI_PATH={configured}"
-        )
-
-    try:
-        version_process = subprocess.run(
-            [cli, "-v"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-            check=False,
-            env=merged_env,
-        )
-    except Exception as exc:
-        raise AgentInvocationError(f"Claude CLI preflight failed: {exc}") from exc
-
-    version_stdout = (version_process.stdout or "").strip()
-    version_stderr = (version_process.stderr or "").strip()
-    version_text = version_stdout or version_stderr
-    parsed = _parse_semver(version_text)
-    if parsed is None:
-        raise AgentInvocationError(
-            "Unable to parse Claude CLI version. "
-            f"raw_output={version_text or '<empty>'}"
-        )
-    if parsed < MIN_CLAUDE_CLI_VERSION:
-        raise AgentInvocationError(
-            "Claude CLI version is too old for claude-agent-sdk. "
-            f"current={parsed[0]}.{parsed[1]}.{parsed[2]}, "
-            f"required>={MIN_CLAUDE_CLI_VERSION[0]}.{MIN_CLAUDE_CLI_VERSION[1]}.{MIN_CLAUDE_CLI_VERSION[2]}"
-        )
 
     # Jework 强制要求使用“激活的 LLM 配置”提供鉴权信息，不允许依赖 Claude CLI 本地登录态。
     has_env_auth = _has_runtime_env_auth(env)
@@ -240,8 +127,6 @@ def _validate_agent_runtime(cwd: str, env: dict[str, str] | None = None) -> dict
         )
 
     return {
-        "cli_path": cli,
-        "cli_version": f"{parsed[0]}.{parsed[1]}.{parsed[2]}",
         "cwd": str(cwd_path),
         "has_auth": "env",
     }
