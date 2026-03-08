@@ -102,6 +102,29 @@ class SendMessageRequest(BaseModel):
     message: str
 
 
+class SessionRunItem(BaseModel):
+    run_id: str
+    session_id: str
+    status: str
+    last_seq: int
+    created_at: str
+    updated_at: str
+    error_message: str | None = None
+
+
+class SessionRunResponse(BaseModel):
+    item: SessionRunItem
+
+
+class SessionRunStreamEvent(BaseModel):
+    seq: int
+    type: str
+    created_at: str
+    data: str = ""
+    title: str | None = None
+    message: str | None = None
+
+
 class StreamChunk(BaseModel):
     type: str
     data: str

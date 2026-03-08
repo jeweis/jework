@@ -1,12 +1,13 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_current_user
-from app.core.errors import AuthForbiddenError
+from app.core.errors import AppError, AuthForbiddenError
 from app.models.schemas import (
     AdminResetUserPasswordRequest,
     BootstrapRequest,
@@ -28,6 +29,8 @@ from app.models.schemas import (
     LoginRequest,
     LoginResponse,
     SendMessageRequest,
+    SessionRunResponse,
+    SessionRunItem,
     SessionDetailResponse,
     SessionListResponse,
     SessionMessageItem,
@@ -54,6 +57,7 @@ from app.services.llm_config_service import llm_config_service
 from app.services.markdown_service import markdown_service
 from app.services.mcp_index_job_service import mcp_index_job_service
 from app.services.mcp_settings_service import mcp_settings_service
+from app.services.session_run_service import TERMINAL_RUN_STATUS, session_run_service
 from app.services.session_service import session_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
@@ -62,6 +66,7 @@ from app.services.workspace_service import workspace_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_run_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 @router.get("/auth/bootstrap-status", response_model=BootstrapStatusResponse)
@@ -682,12 +687,135 @@ def get_session_detail(
     )
 
 
-@router.post("/sessions/{session_id}/messages")
+def _to_session_run_item(run) -> SessionRunItem:
+    return SessionRunItem(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        status=run.status,
+        last_seq=run.last_seq,
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+        error_message=run.error_message,
+    )
+
+
+def _register_background_task(run_id: str, task: asyncio.Task[None]) -> None:
+    """
+    跟踪后台任务引用，避免任务对象被提前释放。
+    """
+    _run_tasks[run_id] = task
+
+    def _cleanup(_: asyncio.Task[None]) -> None:
+        _run_tasks.pop(run_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+async def _execute_session_run(
+    *,
+    session_id: str,
+    run_id: str,
+    user_id: int,
+    prompt: str,
+    workspace_path: str,
+    claude_session_id: str | None,
+    runtime_env: dict[str, str],
+) -> None:
+    """
+    在后台执行一次 run，并持续把中间输出写入事件日志。
+    """
+    session_run_service.set_run_status(
+        session_id=session_id,
+        run_id=run_id,
+        user_id=user_id,
+        status="running",
+    )
+
+    chunks: list[str] = []
+    try:
+        async for event in stream_agent_response(
+            prompt,
+            workspace_path,
+            env=runtime_env,
+            resume_session_id=claude_session_id,
+            on_claude_session_id=lambda claude_sid: session_service.set_claude_session_id(
+                session_id=session_id,
+                user_id=user_id,
+                claude_session_id=claude_sid,
+            ),
+        ):
+            event_type = str(event.get("type", "")).strip()
+            if not event_type:
+                continue
+            data = event.get("data", "")
+            title = event.get("title")
+            message = event.get("message")
+            normalized_data = data if isinstance(data, str) else str(data)
+            normalized_title = title if isinstance(title, str) else None
+            normalized_message = message if isinstance(message, str) else None
+            if event_type == "chunk" and normalized_data:
+                chunks.append(normalized_data)
+            session_run_service.append_event(
+                session_id=session_id,
+                run_id=run_id,
+                user_id=user_id,
+                event_type=event_type,
+                data=normalized_data,
+                title=normalized_title,
+                message=normalized_message,
+            )
+        session_run_service.append_event(
+            session_id=session_id,
+            run_id=run_id,
+            user_id=user_id,
+            event_type="done",
+            message="completed",
+        )
+        session_run_service.set_run_status(
+            session_id=session_id,
+            run_id=run_id,
+            user_id=user_id,
+            status="done",
+        )
+    except Exception as exc:
+        reason = str(exc)
+        logger.exception(
+            "Session run failed: session_id=%s run_id=%s user_id=%s",
+            session_id,
+            run_id,
+            user_id,
+        )
+        session_run_service.append_event(
+            session_id=session_id,
+            run_id=run_id,
+            user_id=user_id,
+            event_type="error",
+            message=reason,
+        )
+        session_run_service.set_run_status(
+            session_id=session_id,
+            run_id=run_id,
+            user_id=user_id,
+            status="error",
+            error_message=reason,
+        )
+    finally:
+        answer = "".join(chunks)
+        if answer:
+            session_service.append_message(
+                session_id=session_id,
+                user_id=user_id,
+                role="assistant",
+                text=answer,
+            )
+
+
+@router.post("/sessions/{session_id}/messages", response_model=SessionRunResponse)
 async def send_message(
     session_id: str,
     body: SendMessageRequest,
     current_user: AuthUser = Depends(get_current_user),
-) -> StreamingResponse:
+) -> SessionRunResponse:
     session = session_service.get_session(session_id, user_id=current_user.id)
     # 每次发送前按 workspace 名实时解析路径，兼容历史会话里持久化路径失效。
     workspace_path = _require_workspace_access(session.workspace, current_user)
@@ -697,6 +825,17 @@ async def send_message(
         workspace_path=workspace_path,
     )
     runtime_env = llm_config_service.get_active_env()
+    running = session_run_service.get_latest_running_run(
+        session_id=session_id,
+        user_id=current_user.id,
+    )
+    if running is not None:
+        raise AppError(
+            code="SESSION_RUN_IN_PROGRESS",
+            message="Another run is still in progress for this session",
+            details={"session_id": session_id, "run_id": running.run_id},
+            status_code=409,
+        )
     session_service.append_message(
         session_id,
         user_id=current_user.id,
@@ -704,45 +843,132 @@ async def send_message(
         text=body.message,
     )
 
+    run = session_run_service.create_run(
+        session_id=session_id,
+        user_id=current_user.id,
+        prompt=body.message,
+    )
+    task = asyncio.create_task(
+        _execute_session_run(
+            session_id=session_id,
+            run_id=run.run_id,
+            user_id=current_user.id,
+            prompt=body.message,
+            workspace_path=str(workspace_path),
+            claude_session_id=session.claude_session_id,
+            runtime_env=runtime_env,
+        ),
+        name=f"session-run-{run.run_id}",
+    )
+    _register_background_task(run.run_id, task)
+    return SessionRunResponse(item=_to_session_run_item(run))
+
+
+@router.get(
+    "/sessions/{session_id}/runs/running",
+    response_model=SessionRunResponse | None,
+)
+def get_running_session_run(
+    session_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> SessionRunResponse | None:
+    session_service.get_session(session_id, user_id=current_user.id)
+    run = session_run_service.get_latest_running_run(
+        session_id=session_id,
+        user_id=current_user.id,
+    )
+    if run is None:
+        return None
+    return SessionRunResponse(item=_to_session_run_item(run))
+
+
+@router.get("/sessions/{session_id}/runs/{run_id}/stream")
+async def stream_session_run(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    after_seq: int = 0,
+    current_user: AuthUser = Depends(get_current_user),
+) -> StreamingResponse:
+    session_service.get_session(session_id, user_id=current_user.id)
+    run = session_run_service.get_run(
+        session_id=session_id,
+        run_id=run_id,
+        user_id=current_user.id,
+    )
+
     async def event_stream():
-        chunks: list[str] = []
+        # 先回放历史，确保刷新后可以无损恢复到最新可见状态。
+        delivered_seq = after_seq
+        history = session_run_service.list_events_after(
+            session_id=session_id,
+            run_id=run_id,
+            user_id=current_user.id,
+            after_seq=after_seq,
+        )
+        for item in history:
+            delivered_seq = max(delivered_seq, item.seq)
+            payload = {
+                "seq": item.seq,
+                "type": item.type,
+                "created_at": item.created_at,
+                "data": item.data,
+                "title": item.title,
+                "message": item.message,
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        if run.status in TERMINAL_RUN_STATUS:
+            return
+
+        queue = session_run_service.subscribe(run_id)
         try:
-            async for event in stream_agent_response(
-                body.message,
-                str(workspace_path),
-                env=runtime_env,
-                resume_session_id=session.claude_session_id,
-                on_claude_session_id=lambda claude_sid: session_service.set_claude_session_id(
-                    session_id=session_id,
-                    user_id=current_user.id,
-                    claude_session_id=claude_sid,
-                ),
-            ):
-                if event.get("type") == "chunk":
-                    data = event.get("data", "")
-                    if isinstance(data, str):
-                        chunks.append(data)
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            logger.exception("Stream message failed: session_id=%s", session_id)
-            yield (
-                "data: "
-                + json.dumps(
-                    {"type": "error", "message": str(exc)},
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    if event.seq <= delivered_seq:
+                        continue
+                    delivered_seq = event.seq
+                    payload = {
+                        "seq": event.seq,
+                        "type": event.type,
+                        "created_at": event.created_at,
+                        "data": event.data,
+                        "title": event.title,
+                        "message": event.message,
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    if event.type in {"done", "error"}:
+                        break
+                except asyncio.TimeoutError:
+                    latest = session_run_service.get_run(
+                        session_id=session_id,
+                        run_id=run_id,
+                        user_id=current_user.id,
+                    )
+                    if latest.status in TERMINAL_RUN_STATUS:
+                        tail = session_run_service.list_events_after(
+                            session_id=session_id,
+                            run_id=run_id,
+                            user_id=current_user.id,
+                            after_seq=delivered_seq,
+                        )
+                        for item in tail:
+                            delivered_seq = max(delivered_seq, item.seq)
+                            payload = {
+                                "seq": item.seq,
+                                "type": item.type,
+                                "created_at": item.created_at,
+                                "data": item.data,
+                                "title": item.title,
+                                "message": item.message,
+                            }
+                            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        break
         finally:
-            answer = "".join(chunks)
-            if answer:
-                session_service.append_message(
-                    session_id=session_id,
-                    user_id=current_user.id,
-                    role="assistant",
-                    text=answer,
-                )
-            yield 'data: {"type": "done"}\n\n'
+            session_run_service.unsubscribe(run_id, queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
