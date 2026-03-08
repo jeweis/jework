@@ -85,6 +85,22 @@ class SessionService:
         session.updated_at = datetime.now(timezone.utc)
         self._save_session(session)
 
+    def set_workspace_path(self, session_id: str, user_id: int, workspace_path: Path) -> None:
+        """
+        回写会话的工作空间绝对路径。
+
+        兼容场景：
+        - 数据目录迁移或机器切换后，历史会话里的 workspace_path 可能失效。
+        - 在真正调用 Agent 前刷新为当前有效路径，可避免 cwd not exists。
+        """
+        session = self.get_session(session_id, user_id=user_id)
+        normalized = workspace_path.resolve()
+        if session.workspace_path.resolve() == normalized:
+            return
+        session.workspace_path = normalized
+        session.updated_at = datetime.now(timezone.utc)
+        self._save_session(session)
+
     def list_workspace_sessions(self, user_id: int, workspace: str) -> list[SessionData]:
         sessions: list[SessionData] = []
         user_dir = self._user_session_dir(workspace, user_id, create=False)

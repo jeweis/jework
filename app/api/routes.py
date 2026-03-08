@@ -689,6 +689,13 @@ async def send_message(
     current_user: AuthUser = Depends(get_current_user),
 ) -> StreamingResponse:
     session = session_service.get_session(session_id, user_id=current_user.id)
+    # 每次发送前按 workspace 名实时解析路径，兼容历史会话里持久化路径失效。
+    workspace_path = _require_workspace_access(session.workspace, current_user)
+    session_service.set_workspace_path(
+        session_id=session_id,
+        user_id=current_user.id,
+        workspace_path=workspace_path,
+    )
     runtime_env = llm_config_service.get_active_env()
     session_service.append_message(
         session_id,
@@ -702,7 +709,7 @@ async def send_message(
         try:
             async for event in stream_agent_response(
                 body.message,
-                str(session.workspace_path),
+                str(workspace_path),
                 env=runtime_env,
                 resume_session_id=session.claude_session_id,
                 on_claude_session_id=lambda claude_sid: session_service.set_claude_session_id(
