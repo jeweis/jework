@@ -256,8 +256,12 @@ async def stream_agent_response(
         options = ClaudeAgentOptions(
             cwd=cwd,
             allowed_tools=resolved_tools,
-            # personal 工作台禁用 Bash，避免绕过目录边界写入 /mnt 等非工作区路径。
-            disallowed_tools=["Bash"] if enable_workspace_write_guard else [],
+            # personal 模式下禁用可绕过目录守卫的高风险工具：
+            # - Bash: 可直接在任意路径执行写操作
+            # - Task/TaskOutput: 可触发子任务执行，导致父级回调守卫失效风险
+            disallowed_tools=(
+                ["Bash", "Task", "TaskOutput"] if enable_workspace_write_guard else []
+            ),
             max_turns=_resolve_agent_max_turns(),
             env=env or {},
             mcp_servers=mcp_servers or {},
@@ -267,7 +271,8 @@ async def stream_agent_response(
             resume=resume_candidate,
             continue_conversation=has_resume,
             include_partial_messages=True,
-            permission_mode="acceptEdits" if enable_workspace_write_guard else None,
+            # 使用 default + can_use_tool 回调，确保每次工具调用都走服务端权限决策。
+            permission_mode="default" if enable_workspace_write_guard else None,
             can_use_tool=_can_use_tool if enable_workspace_write_guard else None,
         )
         try:
