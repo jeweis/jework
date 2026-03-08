@@ -12,6 +12,17 @@ from app.core.errors import AgentInvocationError
 logger = logging.getLogger(__name__)
 DEFAULT_AGENT_MAX_TURNS = 20
 DEFAULT_READ_ONLY_TOOLS = ["Skill", "Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+DEFAULT_PERSONAL_WRITE_TOOLS = [
+    "Skill",
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "WebSearch",
+    "WebFetch",
+]
 MAX_STDERR_LINES = 40
 MIN_CLAUDE_CLI_VERSION = (2, 0, 0)
 
@@ -35,12 +46,64 @@ def _resolve_allowed_tools() -> list[str]:
     return DEFAULT_READ_ONLY_TOOLS
 
 
+def _resolve_personal_allowed_tools() -> list[str]:
+    raw = os.getenv("CLAUDE_AGENT_ALLOWED_PERSONAL_TOOLS", "")
+    parsed = [item.strip() for item in raw.split(",") if item.strip()]
+    if parsed:
+        return parsed
+    return DEFAULT_PERSONAL_WRITE_TOOLS
+
+
 def _tool_use_name(block: Any) -> str | None:
     if block.__class__.__name__ == "ToolUseBlock":
         name = getattr(block, "name", None)
         if isinstance(name, str) and name:
             return name
     return None
+
+
+def _extract_candidate_paths(payload: Any) -> list[str]:
+    """
+    从工具输入中提取潜在路径字段，供工作空间越界校验使用。
+
+    说明：
+    - Claude 不同工具参数命名并不完全一致，这里做“尽力提取”。
+    - 命中字段后统一走 resolve + 前缀比较，避免字符串绕过。
+    """
+    candidates: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = str(key).lower()
+            if normalized_key in {"path", "file_path", "filepath", "target_path"}:
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip())
+                continue
+            if normalized_key in {"paths", "files"} and isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip())
+                continue
+            candidates.extend(_extract_candidate_paths(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            candidates.extend(_extract_candidate_paths(item))
+    return candidates
+
+
+def _is_path_in_workspace(candidate: str, workspace_root: Path) -> bool:
+    # 相对路径按 workspace 根解析；绝对路径直接校验前缀。
+    raw = Path(candidate)
+    resolved = raw.resolve() if raw.is_absolute() else (workspace_root / raw).resolve()
+    return resolved == workspace_root or workspace_root in resolved.parents
+
+
+async def _single_prompt_stream(prompt: str):
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "session_id": "",
+    }
 
 
 def _resolve_cli_path() -> str:
@@ -167,6 +230,9 @@ async def stream_agent_response(
     env: dict[str, str] | None = None,
     resume_session_id: str | None = None,
     on_claude_session_id: Callable[[str], None] | None = None,
+    allowed_tools_override: list[str] | None = None,
+    mcp_servers: dict[str, dict[str, object]] | None = None,
+    enable_workspace_write_guard: bool = False,
 ) -> AsyncGenerator[dict[str, str], None]:
     runtime_diag = _validate_agent_runtime(cwd, env=env)
 
@@ -174,6 +240,8 @@ async def stream_agent_response(
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
+            PermissionResultAllow,
+            PermissionResultDeny,
             ResultMessage,
             TextBlock,
             query,
@@ -197,16 +265,53 @@ async def stream_agent_response(
     last_error: Exception | None = None
     for index, resume_candidate in enumerate(resume_candidates):
         has_resume = bool(resume_candidate)
+        workspace_root = Path(cwd).resolve()
+
+        async def _can_use_tool(
+            tool_name: str,
+            tool_input: dict[str, Any],
+            _context: Any,
+        ):
+            # 个人可写模式：强制所有路径型参数留在 workspace_root 内。
+            if not enable_workspace_write_guard:
+                return PermissionResultAllow()
+            blocked = False
+            for candidate in _extract_candidate_paths(tool_input):
+                if not _is_path_in_workspace(candidate, workspace_root):
+                    blocked = True
+                    break
+            if blocked:
+                return PermissionResultDeny(
+                    message=(
+                        "Path is outside current workspace and was blocked by server guard. "
+                        f"tool={tool_name}"
+                    ),
+                    interrupt=False,
+                )
+            return PermissionResultAllow()
+
+        if allowed_tools_override is not None:
+            resolved_tools = allowed_tools_override
+        elif enable_workspace_write_guard:
+            resolved_tools = _resolve_personal_allowed_tools()
+        else:
+            resolved_tools = _resolve_allowed_tools()
         options = ClaudeAgentOptions(
             cwd=cwd,
-            allowed_tools=_resolve_allowed_tools(),
+            allowed_tools=resolved_tools,
+            # personal 工作台禁用 Bash，避免绕过目录边界写入 /mnt 等非工作区路径。
+            disallowed_tools=["Bash"] if enable_workspace_write_guard else [],
             max_turns=_resolve_agent_max_turns(),
             env=env or {},
+            mcp_servers=mcp_servers or {},
             stderr=_log_stderr,
-            setting_sources=["user", "project"],
+            # 显式包含 local，确保项目下 .claude-local 配置也可被 Claude CLI 读取。
+            setting_sources=["user", "project", "local"],
             resume=resume_candidate,
             continue_conversation=has_resume,
             include_partial_messages=True,
+            permission_mode="acceptEdits" if enable_workspace_write_guard else None,
+            can_use_tool=_can_use_tool if enable_workspace_write_guard else None,
         )
         try:
             logger.warning(
@@ -221,12 +326,28 @@ async def stream_agent_response(
             tool_names: dict[int, str] = {}
             tool_inputs: dict[int, str] = {}
 
-            async for message in query(prompt=prompt, options=options):
+            query_prompt = _single_prompt_stream(prompt) if enable_workspace_write_guard else prompt
+            async for message in query(prompt=query_prompt, options=options):
                 logger.warning(
                     "[claude-sdk] message type=%s payload=%r",
                     type(message).__name__,
                     message,
                 )
+                message_subtype = getattr(message, "subtype", None)
+                if type(message).__name__ == "SystemMessage" and message_subtype == "init":
+                    init_data = getattr(message, "data", {}) or {}
+                    if isinstance(init_data, dict):
+                        init_summary = {
+                            "keys": sorted(str(key) for key in init_data.keys()),
+                            "slash_commands": init_data.get("slash_commands"),
+                            "agents": init_data.get("agents"),
+                            "output_style": init_data.get("output_style"),
+                            "plugins": init_data.get("plugins"),
+                        }
+                        logger.warning(
+                            "[claude-sdk] init summary=%s",
+                            init_summary,
+                        )
 
                 # StreamEvent may not be exported from top-level package in some versions.
                 # Detect partial stream events by structural typing.

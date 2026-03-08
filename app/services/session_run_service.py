@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
+import shutil
 from uuid import uuid4
 
 from app.core.config import settings
@@ -218,6 +219,38 @@ class SessionRunService:
                 queues.remove(queue)
             if not queues and run_id in self._subscribers:
                 self._subscribers.pop(run_id, None)
+
+    def has_running_run(self, *, session_id: str, user_id: int) -> bool:
+        """
+        判断会话是否存在进行中的 run（queued/running）。
+        """
+        return self.get_latest_running_run(session_id=session_id, user_id=user_id) is not None
+
+    def delete_session_runs(self, *, session_id: str, user_id: int) -> int:
+        """
+        删除会话的全部 run 数据，返回删除的 run 数量。
+        """
+        with self._lock:
+            session_user_dir = self._session_user_dir(
+                session_id=session_id,
+                user_id=user_id,
+                create=False,
+            )
+            if not session_user_dir.exists():
+                return 0
+
+            run_count = 0
+            run_ids: list[str] = []
+            for run_dir in session_user_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                run_count += 1
+                run_ids.append(run_dir.name)
+
+            shutil.rmtree(session_user_dir, ignore_errors=True)
+            for run_id in run_ids:
+                self._subscribers.pop(run_id, None)
+            return run_count
 
     def _session_user_dir(self, *, session_id: str, user_id: int, create: bool) -> Path:
         root = (self._root_dir / session_id / str(user_id)).resolve()

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "jework": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "{{jework_root}}/app/services/personal_project_mcp_stdio.py"
+      ],
+      "env": {
+        "JEWORK_PERSONAL_USER_ID": "{{user_id}}",
+        "PYTHONPATH": "{{jework_root}}"
+      }
+    }
+  }
+}

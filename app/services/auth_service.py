@@ -541,22 +541,22 @@ class AuthService:
                 """,
                 (user.id,),
             ).fetchall()
-            return [str(row["workspace"]) for row in rows]
+            from_acl = {str(row["workspace"]) for row in rows}
+            # 个人工作空间由 owner 自动可见，不依赖 ACL 显式分配。
+            personal_rows = self._query_owned_personal_workspaces(conn, user.id)
+            accessible = from_acl.union(personal_rows)
+            # 兜底过滤：若 ACL 中误配置了他人 personal workspace，这里自动剔除。
+            return sorted(
+                workspace
+                for workspace in accessible
+                if self._is_workspace_accessible_for_user(conn, user.id, workspace)
+            )
 
     def can_access_workspace(self, user: AuthUser, workspace: str) -> bool:
         if user.role == "superadmin":
             return True
         with closing(sqlite3.connect(self._db_path)) as conn:
-            row = conn.execute(
-                """
-                SELECT 1
-                FROM user_workspace_access
-                WHERE user_id = ? AND workspace = ?
-                LIMIT 1
-                """,
-                (user.id, workspace),
-            ).fetchone()
-            return row is not None
+            return self._is_workspace_accessible_for_user(conn, user.id, workspace)
 
     def remove_workspace_access_for_all_users(self, workspace: str) -> None:
         with closing(sqlite3.connect(self._db_path)) as conn:
@@ -564,8 +564,13 @@ class AuthService:
                 """
                 DELETE FROM user_workspace_access
                 WHERE workspace = ?
+                   OR workspace IN (
+                        SELECT workspace_name
+                        FROM workspace_registry
+                        WHERE workspace_id = ?
+                   )
                 """,
-                (workspace,),
+                (workspace, workspace),
             )
             conn.commit()
 
@@ -585,6 +590,81 @@ class AuthService:
             user_id = int(row["user_id"])
             result.setdefault(user_id, []).append(str(row["workspace"]))
         return result
+
+    def _query_owned_personal_workspaces(
+        self,
+        conn: sqlite3.Connection,
+        user_id: int,
+    ) -> set[str]:
+        if not self._workspace_registry_exists(conn):
+            return set()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT workspace_id
+            FROM workspace_registry
+            WHERE mode = 'personal' AND owner_user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+        return {str(row["workspace_id"]) for row in rows}
+
+    def _is_workspace_accessible_for_user(
+        self,
+        conn: sqlite3.Connection,
+        user_id: int,
+        workspace_ref: str,
+    ) -> bool:
+        conn.row_factory = sqlite3.Row
+        workspace_id = workspace_ref
+        workspace_name = workspace_ref
+        if self._workspace_registry_exists(conn):
+            rows = conn.execute(
+                """
+                SELECT workspace_id, workspace_name, mode, owner_user_id
+                FROM workspace_registry
+                WHERE workspace_id = ?
+                   OR workspace_name = ?
+                ORDER BY workspace_id = ? DESC
+                """,
+                (workspace_ref, workspace_ref, workspace_ref),
+            ).fetchall()
+            # 名称可能重复（个人空间），逐条评估。
+            for item in rows:
+                mode = str(item["mode"])
+                candidate_workspace_id = str(item["workspace_id"])
+                candidate_workspace_name = str(item["workspace_name"])
+                if mode == "personal":
+                    owner = item["owner_user_id"]
+                    if owner is not None and int(owner) == user_id:
+                        return True
+                    continue
+                workspace_id = candidate_workspace_id
+                workspace_name = candidate_workspace_name
+                break
+
+        acl_row = conn.execute(
+            """
+            SELECT 1
+            FROM user_workspace_access
+            WHERE user_id = ?
+              AND workspace IN (?, ?)
+            LIMIT 1
+            """,
+            (user_id, workspace_id, workspace_name),
+        ).fetchone()
+        return acl_row is not None
+
+    def _workspace_registry_exists(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table' AND name='workspace_registry'
+            LIMIT 1
+            """
+        ).fetchone()
+        return row is not None
 
     def _validate_username(self, username: str) -> None:
         if not _USERNAME_PATTERN.match(username):

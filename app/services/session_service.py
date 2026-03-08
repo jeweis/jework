@@ -22,6 +22,7 @@ class SessionData:
     user_id: int
     workspace: str
     workspace_path: Path
+    scope: str
     claude_session_id: str | None
     created_at: datetime
     updated_at: datetime
@@ -41,6 +42,24 @@ class SessionService:
             user_id=user_id,
             workspace=workspace,
             workspace_path=workspace_path,
+            scope="workspace",
+            claude_session_id=None,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            messages=[],
+        )
+        self._store[session_id] = data
+        self._save_session(data)
+        return data
+
+    def create_personal_agent_session(self, user_id: int, workspace_path: Path) -> SessionData:
+        session_id = str(uuid4())
+        data = SessionData(
+            session_id=session_id,
+            user_id=user_id,
+            workspace="personal-agent",
+            workspace_path=workspace_path,
+            scope="personal_agent",
             claude_session_id=None,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
@@ -123,6 +142,27 @@ class SessionService:
             return None
         return sessions[0]
 
+    def list_personal_agent_sessions(self, user_id: int) -> list[SessionData]:
+        sessions = self.list_workspace_sessions(user_id=user_id, workspace="personal-agent")
+        return [item for item in sessions if item.scope == "personal_agent"]
+
+    def get_latest_personal_agent_session(self, user_id: int) -> SessionData | None:
+        sessions = self.list_personal_agent_sessions(user_id=user_id)
+        if not sessions:
+            return None
+        return sessions[0]
+
+    def delete_session(self, session_id: str, user_id: int) -> SessionData:
+        """
+        删除指定会话（仅允许删除当前用户会话）。
+        """
+        session = self.get_session(session_id, user_id=user_id)
+        session_file = self._session_file(session.workspace, session.user_id, session.session_id)
+        if session_file.exists():
+            session_file.unlink()
+        self._store.pop(session_id, None)
+        return session
+
     def _workspace_session_dir(self, workspace: str, create: bool = True) -> Path:
         workspace_dir = (self._session_dir / workspace).resolve()
         if create:
@@ -144,6 +184,7 @@ class SessionService:
             "user_id": session.user_id,
             "workspace": session.workspace,
             "workspace_path": str(session.workspace_path),
+            "scope": session.scope,
             "claude_session_id": session.claude_session_id,
             "created_at": session.created_at.isoformat(),
             "updated_at": session.updated_at.isoformat(),
@@ -189,6 +230,7 @@ class SessionService:
             user_id=user_id,
             workspace=payload["workspace"],
             workspace_path=Path(payload["workspace_path"]),
+            scope=str(payload.get("scope") or "workspace"),
             claude_session_id=payload.get("claude_session_id"),
             created_at=created_at,
             updated_at=updated_at,

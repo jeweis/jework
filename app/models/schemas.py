@@ -4,8 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class WorkspaceItem(BaseModel):
+    workspace_id: str
     name: str
     path: str
+    mode: str = "team"
+    owner_user_id: int | None = None
     note: str | None = None
     git_url: str | None = None
     git_username: str | None = None
@@ -20,6 +23,7 @@ class WorkspaceListResponse(BaseModel):
 
 class CreateWorkspaceRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
+    mode: str = Field(default="team", max_length=32)
     git_url: str | None = None
     git_username: str | None = None
     git_pat: str | None = None
@@ -62,6 +66,36 @@ class WorkspaceDeleteResponse(BaseModel):
     deleted_at: str
 
 
+class AgentMcpServerItem(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    type: str = Field(min_length=1, max_length=16)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class WorkspaceSkillItem(BaseModel):
+    name: str
+    relative_path: str
+    description: str | None = None
+
+
+class WorkspaceAgentProfileItem(BaseModel):
+    workspace_id: str
+    workspace_name: str
+    mcp_servers: list[AgentMcpServerItem] = Field(default_factory=list)
+    extra_allowed_tools: list[str] = Field(default_factory=list)
+    skills: list[WorkspaceSkillItem] = Field(default_factory=list)
+    updated_by: int | None = None
+    updated_at: str | None = None
+
+
+class UpdateWorkspaceAgentProfileRequest(BaseModel):
+    mcp_servers: list[AgentMcpServerItem] = Field(default_factory=list)
+    extra_allowed_tools: list[str] = Field(default_factory=list)
+
+
 class CreateSessionRequest(BaseModel):
     workspace: str
 
@@ -69,6 +103,7 @@ class CreateSessionRequest(BaseModel):
 class CreateSessionResponse(BaseModel):
     session_id: str
     workspace: str
+    scope: str = "workspace"
     created_at: datetime
 
 
@@ -81,6 +116,7 @@ class SessionMessageItem(BaseModel):
 class SessionDetailResponse(BaseModel):
     session_id: str
     workspace: str
+    scope: str = "workspace"
     created_at: datetime
     messages: list[SessionMessageItem]
 
@@ -88,6 +124,7 @@ class SessionDetailResponse(BaseModel):
 class SessionSummaryItem(BaseModel):
     session_id: str
     workspace: str
+    scope: str = "workspace"
     created_at: datetime
     updated_at: datetime
     message_count: int
@@ -96,6 +133,14 @@ class SessionSummaryItem(BaseModel):
 
 class SessionListResponse(BaseModel):
     items: list[SessionSummaryItem]
+
+
+class DeleteSessionResponse(BaseModel):
+    session_id: str
+    workspace: str
+    scope: str = "workspace"
+    deleted_at: str
+    removed_runs: int
 
 
 class SendMessageRequest(BaseModel):
@@ -384,4 +429,32 @@ class MarkdownContentResponse(BaseModel):
     content: str
 
 
+class FileNodeItem(BaseModel):
+    type: str
+    name: str
+    path: str
+    size: int | None = None
+    mtime: str | None = None
+    children: list["FileNodeItem"] | None = None
+
+
+class FileIndexResponse(BaseModel):
+    workspace: str
+    generated_at: str
+    items: list[FileNodeItem]
+
+
+class FileContentResponse(BaseModel):
+    workspace: str
+    path: str
+    name: str
+    size: int
+    mtime: str
+    content_type: str
+    content: str
+    is_binary: bool
+    truncated: bool
+
+
 MarkdownNodeItem.model_rebuild()
+FileNodeItem.model_rebuild()

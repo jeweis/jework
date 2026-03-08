@@ -24,6 +24,8 @@ from app.services.mcp_token_service import mcp_token_service
 from app.services.mcp_vector_service import mcp_vector_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
+from app.services.workspace_agent_profile_service import workspace_agent_profile_service
+from app.services.workspace_service import workspace_service
 
 _fastmcp_app = build_fastmcp_asgi_app()
 
@@ -150,10 +152,12 @@ async def _rewrite_dynamic_mcp_base_path(
 
 def _startup() -> None:
     auth_service.init_db()
+    workspace_service.init_db()
     feishu_settings_service.init_db()
     llm_config_service.init_db()
     workspace_credential_service.init_db()
     workspace_git_service.init_db()
+    workspace_agent_profile_service.init_db()
     mcp_token_service.init_db()
     mcp_settings_service.init_db()
     mcp_index_job_service.init_db()

@@ -3,8 +3,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.api.deps import get_current_user
 from app.core.errors import AppError, AuthForbiddenError
@@ -19,8 +19,12 @@ from app.models.schemas import (
     CreateLlmConfigRequest,
     CreateSessionRequest,
     CreateSessionResponse,
+    DeleteSessionResponse,
     CreateUserRequest,
     CreateWorkspaceRequest,
+    FileContentResponse,
+    FileIndexResponse,
+    FileNodeItem,
     LlmConfigItem,
     LlmConfigListResponse,
     MarkdownContentResponse,
@@ -39,34 +43,45 @@ from app.models.schemas import (
     UpdateUserWorkspaceAccessRequest,
     UpdateFeishuSettingsRequest,
     UpdateWorkspaceCredentialRequest,
+    UpdateWorkspaceAgentProfileRequest,
     UpdateWorkspaceNoteRequest,
     UserListResponse,
     UserResponse,
     WorkspaceCredentialItem,
     WorkspaceDeleteResponse,
     WorkspaceItem,
+    WorkspaceAgentProfileItem,
     WorkspaceListResponse,
     WorkspaceNoteItem,
     WorkspacePullResponse,
+    WorkspaceSkillItem,
 )
-from app.services.agent_service import stream_agent_response
+from app.services.agent_service import (
+    DEFAULT_PERSONAL_WRITE_TOOLS,
+    DEFAULT_READ_ONLY_TOOLS,
+    stream_agent_response,
+)
 from app.services.auth_service import AuthUser, auth_service
 from app.services.feishu_auth_service import feishu_auth_service
 from app.services.feishu_settings_service import feishu_settings_service
 from app.services.llm_config_service import llm_config_service
 from app.services.markdown_service import markdown_service
+from app.services.file_preview_service import file_preview_service
 from app.services.mcp_index_job_service import mcp_index_job_service
 from app.services.mcp_settings_service import mcp_settings_service
+from app.services.personal_agent_service import personal_agent_service
 from app.services.session_run_service import TERMINAL_RUN_STATUS, session_run_service
 from app.services.session_service import session_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
 from app.services.workspace_note_service import workspace_note_service
+from app.services.workspace_agent_profile_service import workspace_agent_profile_service
 from app.services.workspace_service import workspace_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 _run_tasks: dict[str, asyncio.Task[None]] = {}
+_WORKSPACE_WRITE_TOOLS = {"write", "edit", "multiedit", "notebookedit"}
 
 
 @router.get("/auth/bootstrap-status", response_model=BootstrapStatusResponse)
@@ -236,11 +251,23 @@ def create_user(
     body: CreateUserRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> UserResponse:
+    normalized = sorted(set(body.workspace_names))
+    normalized_ids: list[str] = []
+    for workspace in normalized:
+        meta = workspace_service.get_workspace_meta(workspace)
+        if meta.mode != "team":
+            raise AppError(
+                code="WORKSPACE_ASSIGNMENT_FORBIDDEN",
+                message="Only team workspaces can be assigned in user ACL",
+                details={"workspace": workspace, "mode": meta.mode},
+                status_code=400,
+            )
+        normalized_ids.append(meta.workspace_id)
     user = auth_service.create_user(
         current_user=current_user,
         username=body.username,
         password=body.password,
-        workspace_names=body.workspace_names,
+        workspace_names=sorted(set(normalized_ids)),
     )
     return UserResponse(
         id=user.id,
@@ -260,12 +287,21 @@ def update_user_workspaces(
     current_user: AuthUser = Depends(get_current_user),
 ) -> UserResponse:
     normalized = sorted(set(body.workspace_names))
+    normalized_ids: list[str] = []
     for workspace in normalized:
-        workspace_service.get_workspace_path(workspace)
+        meta = workspace_service.get_workspace_meta(workspace)
+        if meta.mode != "team":
+            raise AppError(
+                code="WORKSPACE_ASSIGNMENT_FORBIDDEN",
+                message="Only team workspaces can be assigned in user ACL",
+                details={"workspace": workspace, "mode": meta.mode},
+                status_code=400,
+            )
+        normalized_ids.append(meta.workspace_id)
     accessible = auth_service.set_user_workspace_access(
         current_user=current_user,
         user_id=user_id,
-        workspace_names=normalized,
+        workspace_names=sorted(set(normalized_ids)),
     )
     users = auth_service.list_users(current_user)
     target = next((item for item in users if item.id == user_id), None)
@@ -427,15 +463,29 @@ def create_workspace(
     body: CreateWorkspaceRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceItem:
-    if current_user.role != "superadmin":
-        raise AuthForbiddenError()
+    mode = body.mode.strip().lower()
+    if mode == "team":
+        if current_user.role != "superadmin":
+            raise AuthForbiddenError()
+        owner_user_id: int | None = None
+    elif mode == "personal":
+        owner_user_id = current_user.id
+    else:
+        raise AppError(
+            code="WORKSPACE_MODE_INVALID",
+            message="workspace mode must be team or personal",
+            details={"mode": body.mode},
+            status_code=400,
+        )
 
     return workspace_service.create_workspace(
         workspace=body.name,
+        mode=mode,
         git_url=body.git_url,
         git_username=body.git_username,
         git_pat=body.git_pat,
-        user_id=current_user.id,
+        creator_user_id=current_user.id,
+        owner_user_id=owner_user_id,
     )
 
 
@@ -444,15 +494,25 @@ def delete_workspace(
     workspace: str,
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceDeleteResponse:
-    if current_user.role != "superadmin":
+    meta = workspace_service.get_workspace_meta(workspace)
+    if meta.mode == "team" and current_user.role != "superadmin":
         raise AuthForbiddenError()
+    if meta.mode == "personal":
+        if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+            raise AuthForbiddenError()
 
     result = workspace_service.delete_workspace(workspace)
-    removed_sessions = session_service.delete_workspace_sessions(workspace)
-    workspace_credential_service.delete_workspace_credential(workspace)
-    workspace_git_service.delete_sync_meta(workspace)
-    workspace_note_service.delete_note(workspace)
-    auth_service.remove_workspace_access_for_all_users(workspace)
+    removed_sessions = (
+        session_service.delete_workspace_sessions(meta.workspace_id)
+        + session_service.delete_workspace_sessions(meta.workspace_name)
+    )
+    workspace_credential_service.delete_workspace_credential(meta.workspace_id)
+    workspace_credential_service.delete_workspace_credential(meta.workspace_name)
+    workspace_git_service.delete_sync_meta(meta.workspace_id)
+    workspace_git_service.delete_sync_meta(meta.workspace_name)
+    workspace_note_service.delete_note(meta.workspace_id)
+    workspace_note_service.delete_note(meta.workspace_name)
+    auth_service.remove_workspace_access_for_all_users(meta.workspace_id)
 
     return WorkspaceDeleteResponse(
         workspace=workspace,
@@ -466,14 +526,21 @@ def get_workspace_credential(
     workspace: str,
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceCredentialItem:
-    if current_user.role != "superadmin":
+    meta = workspace_service.get_workspace_meta(workspace)
+    if meta.mode == "team" and current_user.role != "superadmin":
         raise AuthForbiddenError()
-    workspace_service.get_workspace_path(workspace)
-    item = workspace_credential_service.get_workspace_credential(workspace)
+    if meta.mode == "personal":
+        if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+            raise AuthForbiddenError()
+    workspace_service.get_workspace_path(meta.workspace_id)
+    item = workspace_credential_service.get_workspace_credential(meta.workspace_id)
     if item is None:
-        return WorkspaceCredentialItem(workspace=workspace)
+        # 兼容历史 name 键。
+        item = workspace_credential_service.get_workspace_credential(meta.workspace_name)
+    if item is None:
+        return WorkspaceCredentialItem(workspace=meta.workspace_name)
     return WorkspaceCredentialItem(
-        workspace=item.workspace,
+        workspace=meta.workspace_name,
         git_url=item.git_url,
         git_username=item.git_username,
         has_git_pat=item.has_git_pat,
@@ -486,17 +553,21 @@ def update_workspace_note(
     body: UpdateWorkspaceNoteRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceNoteItem:
-    if current_user.role != "superadmin":
+    meta = workspace_service.get_workspace_meta(workspace)
+    if meta.mode == "team" and current_user.role != "superadmin":
         raise AuthForbiddenError()
-    workspace_service.get_workspace_path(workspace)
+    if meta.mode == "personal":
+        if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+            raise AuthForbiddenError()
+    workspace_service.get_workspace_path(meta.workspace_id)
     updated_at = datetime.now(timezone.utc).isoformat()
     item = workspace_note_service.upsert_note(
-        workspace=workspace,
+        workspace=meta.workspace_id,
         note=body.note,
         updated_at=updated_at,
     )
     return WorkspaceNoteItem(
-        workspace=item.workspace,
+        workspace=meta.workspace_name,
         note=item.note,
         updated_at=item.updated_at,
     )
@@ -508,24 +579,114 @@ def update_workspace_credential(
     body: UpdateWorkspaceCredentialRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceCredentialItem:
-    if current_user.role != "superadmin":
+    meta = workspace_service.get_workspace_meta(workspace)
+    if meta.mode == "team" and current_user.role != "superadmin":
         raise AuthForbiddenError()
-    workspace_service.get_workspace_path(workspace)
+    if meta.mode == "personal":
+        if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+            raise AuthForbiddenError()
+    workspace_service.get_workspace_path(meta.workspace_id)
     workspace_credential_service.upsert_workspace_credential(
-        workspace=workspace,
+        workspace=meta.workspace_id,
         user_id=current_user.id,
         git_username=body.git_username,
         git_pat=body.git_pat,
     )
-    item = workspace_credential_service.get_workspace_credential(workspace)
+    item = workspace_credential_service.get_workspace_credential(meta.workspace_id)
     if item is None:
-        return WorkspaceCredentialItem(workspace=workspace)
+        return WorkspaceCredentialItem(workspace=meta.workspace_name)
     return WorkspaceCredentialItem(
-        workspace=item.workspace,
+        workspace=meta.workspace_name,
         git_url=item.git_url,
         git_username=item.git_username,
         has_git_pat=item.has_git_pat,
     )
+
+
+@router.get(
+    "/workspaces/{workspace}/agent-profile",
+    response_model=WorkspaceAgentProfileItem,
+)
+def get_workspace_agent_profile(
+    workspace: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAgentProfileItem:
+    meta, workspace_path = _require_personal_workspace_manage_access(
+        workspace,
+        current_user,
+    )
+    profile = workspace_agent_profile_service.get_profile(meta.workspace_id)
+    skills = workspace_agent_profile_service.list_skills(workspace_path)
+    return _to_workspace_agent_profile_item(meta, profile, skills)
+
+
+@router.put(
+    "/workspaces/{workspace}/agent-profile",
+    response_model=WorkspaceAgentProfileItem,
+)
+def update_workspace_agent_profile(
+    workspace: str,
+    body: UpdateWorkspaceAgentProfileRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAgentProfileItem:
+    meta, workspace_path = _require_personal_workspace_manage_access(
+        workspace,
+        current_user,
+    )
+    profile = workspace_agent_profile_service.upsert_profile(
+        workspace_id=meta.workspace_id,
+        mcp_servers=[item.model_dump() for item in body.mcp_servers],
+        extra_allowed_tools=body.extra_allowed_tools,
+        updated_by=current_user.id,
+    )
+    skills = workspace_agent_profile_service.list_skills(workspace_path)
+    return _to_workspace_agent_profile_item(meta, profile, skills)
+
+
+@router.post(
+    "/workspaces/{workspace}/skills/upload",
+    response_model=WorkspaceAgentProfileItem,
+)
+async def upload_workspace_skill(
+    workspace: str,
+    file: UploadFile = File(...),
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAgentProfileItem:
+    meta, workspace_path = _require_personal_workspace_manage_access(
+        workspace,
+        current_user,
+    )
+    raw = await file.read()
+    workspace_agent_profile_service.upload_skill(
+        workspace_path=workspace_path,
+        filename=file.filename or "",
+        content=raw,
+    )
+    profile = workspace_agent_profile_service.get_profile(meta.workspace_id)
+    skills = workspace_agent_profile_service.list_skills(workspace_path)
+    return _to_workspace_agent_profile_item(meta, profile, skills)
+
+
+@router.delete(
+    "/workspaces/{workspace}/skills/{skill_name}",
+    response_model=WorkspaceAgentProfileItem,
+)
+def delete_workspace_skill(
+    workspace: str,
+    skill_name: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAgentProfileItem:
+    meta, workspace_path = _require_personal_workspace_manage_access(
+        workspace,
+        current_user,
+    )
+    workspace_agent_profile_service.delete_skill(
+        workspace_path=workspace_path,
+        skill_name=skill_name,
+    )
+    profile = workspace_agent_profile_service.get_profile(meta.workspace_id)
+    skills = workspace_agent_profile_service.list_skills(workspace_path)
+    return _to_workspace_agent_profile_item(meta, profile, skills)
 
 
 @router.get("/workspaces/{workspace}/markdown-index", response_model=MarkdownIndexResponse)
@@ -539,6 +700,75 @@ def get_workspace_markdown_index(
         workspace=workspace,
         generated_at=datetime.now(timezone.utc).isoformat(),
         items=[_to_markdown_node_item(node) for node in nodes],
+    )
+
+
+@router.get("/workspaces/{workspace}/file-index", response_model=FileIndexResponse)
+def get_workspace_file_index(
+    workspace: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> FileIndexResponse:
+    """
+    个人工作空间文件索引（新文件预览功能使用）。
+    """
+    _, workspace_path = _require_personal_workspace_manage_access(workspace, current_user)
+    nodes = file_preview_service.build_index(workspace_path=workspace_path)
+    return FileIndexResponse(
+        workspace=workspace,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        items=[_to_file_node_item(node) for node in nodes],
+    )
+
+
+@router.get("/workspaces/{workspace}/file-content", response_model=FileContentResponse)
+def get_workspace_file_content(
+    workspace: str,
+    path: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> FileContentResponse:
+    """
+    个人工作空间文件内容读取，支持 markdown/code/text/binary 识别。
+    """
+    _, workspace_path = _require_personal_workspace_manage_access(workspace, current_user)
+    settings_value = mcp_settings_service.get_settings()
+    content = file_preview_service.read_file_content(
+        workspace=workspace,
+        workspace_path=workspace_path,
+        relative_path=path,
+        max_bytes=settings_value.kb_file_max_bytes,
+        max_lines=settings_value.kb_read_max_lines,
+    )
+    return FileContentResponse(
+        workspace=content.workspace,
+        path=content.path,
+        name=content.name,
+        size=content.size,
+        mtime=content.mtime,
+        content_type=content.content_type,
+        content=content.content,
+        is_binary=content.is_binary,
+        truncated=content.truncated,
+    )
+
+
+@router.get("/workspaces/{workspace}/file-download")
+def download_workspace_file(
+    workspace: str,
+    path: str,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """
+    下载个人工作空间中的任意文件（原始字节，不受预览截断限制）。
+    """
+    _, workspace_path = _require_personal_workspace_manage_access(workspace, current_user)
+    target = file_preview_service.resolve_existing_file(
+        workspace_path=workspace_path,
+        relative_path=path,
+    )
+    return FileResponse(
+        path=str(target),
+        filename=target.name,
+        media_type="application/octet-stream",
     )
 
 
@@ -612,6 +842,27 @@ def create_session(
     return CreateSessionResponse(
         session_id=session.session_id,
         workspace=session.workspace,
+        scope=session.scope,
+        created_at=session.created_at,
+    )
+
+
+@router.post("/personal-agent/sessions", response_model=CreateSessionResponse)
+def create_personal_agent_session(
+    current_user: AuthUser = Depends(get_current_user),
+) -> CreateSessionResponse:
+    bootstrap = personal_agent_service.ensure_main_agent_workspace(
+        user_id=current_user.id,
+        username=current_user.username,
+    )
+    session = session_service.create_personal_agent_session(
+        user_id=current_user.id,
+        workspace_path=bootstrap.main_agent_root,
+    )
+    return CreateSessionResponse(
+        session_id=session.session_id,
+        workspace=session.workspace,
+        scope=session.scope,
         created_at=session.created_at,
     )
 
@@ -631,6 +882,30 @@ def list_workspace_sessions(
             SessionSummaryItem(
                 session_id=session.session_id,
                 workspace=session.workspace,
+                scope=session.scope,
+                created_at=session.created_at,
+                updated_at=session.updated_at,
+                message_count=len(session.messages),
+                last_message_preview=session.messages[-1].text[:120]
+                if session.messages
+                else "",
+            )
+            for session in sessions
+        ]
+    )
+
+
+@router.get("/personal-agent/sessions", response_model=SessionListResponse)
+def list_personal_agent_sessions(
+    current_user: AuthUser = Depends(get_current_user),
+) -> SessionListResponse:
+    sessions = session_service.list_personal_agent_sessions(user_id=current_user.id)
+    return SessionListResponse(
+        items=[
+            SessionSummaryItem(
+                session_id=session.session_id,
+                workspace=session.workspace,
+                scope=session.scope,
                 created_at=session.created_at,
                 updated_at=session.updated_at,
                 message_count=len(session.messages),
@@ -658,6 +933,25 @@ def get_latest_workspace_session(
     return SessionSummaryItem(
         session_id=session.session_id,
         workspace=session.workspace,
+        scope=session.scope,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        message_count=len(session.messages),
+        last_message_preview=session.messages[-1].text[:120] if session.messages else "",
+    )
+
+
+@router.get("/personal-agent/sessions/latest", response_model=SessionSummaryItem)
+def get_latest_personal_agent_session(
+    current_user: AuthUser = Depends(get_current_user),
+) -> SessionSummaryItem:
+    session = session_service.get_latest_personal_agent_session(user_id=current_user.id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="No personal-agent session found")
+    return SessionSummaryItem(
+        session_id=session.session_id,
+        workspace=session.workspace,
+        scope=session.scope,
         created_at=session.created_at,
         updated_at=session.updated_at,
         message_count=len(session.messages),
@@ -675,6 +969,7 @@ def get_session_detail(
     return SessionDetailResponse(
         session_id=session.session_id,
         workspace=session.workspace,
+        scope=session.scope,
         created_at=session.created_at,
         messages=[
             SessionMessageItem(
@@ -684,6 +979,37 @@ def get_session_detail(
             )
             for message in messages
         ],
+    )
+
+
+@router.delete("/sessions/{session_id}", response_model=DeleteSessionResponse)
+def delete_session(
+    session_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> DeleteSessionResponse:
+    # 正在执行中的会话不允许删除，避免后台任务继续写入被删除的会话。
+    if session_run_service.has_running_run(
+        session_id=session_id,
+        user_id=current_user.id,
+    ):
+        raise AppError(
+            code="SESSION_RUN_IN_PROGRESS",
+            message="Session run still in progress",
+            details={"session_id": session_id},
+            status_code=409,
+        )
+
+    session = session_service.delete_session(session_id=session_id, user_id=current_user.id)
+    removed_runs = session_run_service.delete_session_runs(
+        session_id=session_id,
+        user_id=current_user.id,
+    )
+    return DeleteSessionResponse(
+        session_id=session.session_id,
+        workspace=session.workspace,
+        scope=session.scope,
+        deleted_at=datetime.now(timezone.utc).isoformat(),
+        removed_runs=removed_runs,
     )
 
 
@@ -717,9 +1043,13 @@ async def _execute_session_run(
     run_id: str,
     user_id: int,
     prompt: str,
+    workspace: str,
     workspace_path: str,
+    workspace_mode: str,
     claude_session_id: str | None,
     runtime_env: dict[str, str],
+    mcp_servers: dict[str, dict[str, object]],
+    allowed_tools: list[str],
 ) -> None:
     """
     在后台执行一次 run，并持续把中间输出写入事件日志。
@@ -732,6 +1062,7 @@ async def _execute_session_run(
     )
 
     chunks: list[str] = []
+    has_workspace_change = False
     try:
         async for event in stream_agent_response(
             prompt,
@@ -743,6 +1074,9 @@ async def _execute_session_run(
                 user_id=user_id,
                 claude_session_id=claude_sid,
             ),
+            allowed_tools_override=allowed_tools,
+            mcp_servers=mcp_servers,
+            enable_workspace_write_guard=(workspace_mode == "personal"),
         ):
             event_type = str(event.get("type", "")).strip()
             if not event_type:
@@ -755,6 +1089,10 @@ async def _execute_session_run(
             normalized_message = message if isinstance(message, str) else None
             if event_type == "chunk" and normalized_data:
                 chunks.append(normalized_data)
+            if event_type == "tool":
+                tool_name = _extract_tool_name_from_title(normalized_title)
+                if tool_name is not None and tool_name.lower() in _WORKSPACE_WRITE_TOOLS:
+                    has_workspace_change = True
             session_run_service.append_event(
                 session_id=session_id,
                 run_id=run_id,
@@ -763,6 +1101,15 @@ async def _execute_session_run(
                 data=normalized_data,
                 title=normalized_title,
                 message=normalized_message,
+            )
+        if has_workspace_change:
+            session_run_service.append_event(
+                session_id=session_id,
+                run_id=run_id,
+                user_id=user_id,
+                event_type="workspace_dirty",
+                data=workspace,
+                message="workspace changed by agent tools",
             )
         session_run_service.append_event(
             session_id=session_id,
@@ -817,14 +1164,56 @@ async def send_message(
     current_user: AuthUser = Depends(get_current_user),
 ) -> SessionRunResponse:
     session = session_service.get_session(session_id, user_id=current_user.id)
-    # 每次发送前按 workspace 名实时解析路径，兼容历史会话里持久化路径失效。
-    workspace_path = _require_workspace_access(session.workspace, current_user)
+    runtime_env = llm_config_service.get_active_env()
+    if session.scope == "personal_agent":
+        bootstrap = personal_agent_service.ensure_main_agent_workspace(
+            user_id=current_user.id,
+            username=current_user.username,
+        )
+        workspace_path = bootstrap.main_agent_root
+        workspace_mode = "personal"
+        workspace_key = session.workspace
+        # personal-agent 改为纯项目级配置透传：
+        # - MCP 由 workspace 根目录 .mcp.json 管理
+        # - 这里不再代码注入 mcp_servers（避免覆盖项目配置）
+        personal_mcp_server_names = ("jework", "personal_project")
+        allowed_tools = _merge_allowed_tools(
+            DEFAULT_PERSONAL_WRITE_TOOLS,
+            [
+                f"mcp__{server_name}__list_projects"
+                for server_name in personal_mcp_server_names
+            ]
+            + [
+                f"mcp__{server_name}__create_project"
+                for server_name in personal_mcp_server_names
+            ],
+        )
+        workspace_mcp_servers: dict[str, dict[str, object]] = {}
+    else:
+        # 每次发送前按 workspace 名实时解析路径，兼容历史会话里持久化路径失效。
+        workspace_path = _require_workspace_access(session.workspace, current_user)
+        workspace_meta = workspace_service.get_workspace_meta(session.workspace)
+        profile = workspace_agent_profile_service.get_profile(workspace_meta.workspace_id)
+        workspace_mcp_servers = workspace_agent_profile_service.build_sdk_mcp_servers(
+            profile.mcp_servers,
+            runtime_env,
+        )
+        derived_mcp_tools = _derive_mcp_allowed_tools(profile.mcp_servers)
+        if workspace_meta.mode == "personal":
+            allowed_tools = _merge_allowed_tools(
+                DEFAULT_PERSONAL_WRITE_TOOLS,
+                [*profile.extra_allowed_tools, *derived_mcp_tools],
+            )
+        else:
+            allowed_tools = list(DEFAULT_READ_ONLY_TOOLS)
+        workspace_mode = workspace_meta.mode
+        workspace_key = session.workspace
+
     session_service.set_workspace_path(
         session_id=session_id,
         user_id=current_user.id,
         workspace_path=workspace_path,
     )
-    runtime_env = llm_config_service.get_active_env()
     running = session_run_service.get_latest_running_run(
         session_id=session_id,
         user_id=current_user.id,
@@ -854,9 +1243,13 @@ async def send_message(
             run_id=run.run_id,
             user_id=current_user.id,
             prompt=body.message,
+            workspace=workspace_key,
             workspace_path=str(workspace_path),
+            workspace_mode=workspace_mode,
             claude_session_id=session.claude_session_id,
             runtime_env=runtime_env,
+            mcp_servers=workspace_mcp_servers,
+            allowed_tools=allowed_tools,
         ),
         name=f"session-run-{run.run_id}",
     )
@@ -986,7 +1379,139 @@ def _to_markdown_node_item(node) -> MarkdownNodeItem:
     )
 
 
-def _require_workspace_access(workspace: str, current_user: AuthUser):
+def _to_file_node_item(node) -> FileNodeItem:
+    return FileNodeItem(
+        type=node.type,
+        name=node.name,
+        path=node.path,
+        size=node.size,
+        mtime=node.mtime,
+        children=[_to_file_node_item(child) for child in node.children or []]
+        if node.children is not None
+        else None,
+    )
+
+
+def _extract_tool_name_from_title(title: str | None) -> str | None:
+    if title is None:
+        return None
+    raw = title.strip()
+    if not raw:
+        return None
+    # 标题格式通常为“调用工具: ToolName”，这里做容错解析。
+    if ":" in raw:
+        return raw.split(":")[-1].strip()
+    if "：" in raw:
+        return raw.split("：")[-1].strip()
+    return raw
+
+
+def _to_workspace_agent_profile_item(meta, profile, skills) -> WorkspaceAgentProfileItem:
+    return WorkspaceAgentProfileItem(
+        workspace_id=meta.workspace_id,
+        workspace_name=meta.workspace_name,
+        mcp_servers=[
+            {
+                "name": item.name,
+                "type": item.type,
+                "url": item.url,
+                "command": item.command,
+                "args": item.args,
+                "headers": item.headers,
+            }
+            for item in profile.mcp_servers
+        ],
+        extra_allowed_tools=profile.extra_allowed_tools,
+        skills=[
+            WorkspaceSkillItem(
+                name=item.name,
+                relative_path=item.relative_path,
+                description=item.description,
+            )
+            for item in skills
+        ],
+        updated_by=profile.updated_by,
+        updated_at=profile.updated_at,
+    )
+
+
+def _merge_allowed_tools(
+    base_tools: list[str],
+    extra_tools: list[str],
+) -> list[str]:
+    """
+    合并基础工具与扩展工具，保持顺序且自动去重。
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in [*base_tools, *extra_tools]:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(normalized)
+    return merged
+
+
+def _derive_mcp_allowed_tools(mcp_servers) -> list[str]:
+    """
+    根据 MCP 服务器名自动派生 Jework 常用工具白名单。
+
+    这样用户只需配置服务器地址，不必手工填写 mcp__server__tool。
+    """
+    jework_tools = [
+        "list_workspaces",
+        "list_files",
+        "read_file",
+        "grep_files",
+        "semantic_search",
+        "hybrid_search",
+    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for server in mcp_servers:
+        name = str(getattr(server, "name", "")).strip()
+        if not name:
+            continue
+        for tool in jework_tools:
+            item = f"mcp__{name}__{tool}"
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _require_personal_workspace_manage_access(
+    workspace: str,
+    current_user: AuthUser,
+):
+    meta, workspace_path = _resolve_workspace_with_access(workspace, current_user)
+    if meta.mode != "personal":
+        raise AppError(
+            code="WORKSPACE_AGENT_PROFILE_FORBIDDEN",
+            message="Only personal workspace supports Agent profile",
+            details={"workspace": workspace, "mode": meta.mode},
+            status_code=400,
+        )
+    if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+        raise AuthForbiddenError()
+    return meta, workspace_path
+
+
+def _resolve_workspace_with_access(workspace: str, current_user: AuthUser):
     if not auth_service.can_access_workspace(current_user, workspace):
         raise AuthForbiddenError()
-    return workspace_service.get_workspace_path(workspace)
+    allowed_ids = None
+    if current_user.role != "superadmin":
+        allowed_ids = set(auth_service.get_accessible_workspaces(current_user))
+    meta = workspace_service.resolve_workspace_reference(
+        workspace,
+        allowed_workspace_ids=allowed_ids,
+    )
+    return meta, workspace_service.get_workspace_path(meta.workspace_id)
+
+
+def _require_workspace_access(workspace: str, current_user: AuthUser):
+    _, workspace_path = _resolve_workspace_with_access(workspace, current_user)
+    return workspace_path
