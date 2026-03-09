@@ -512,7 +512,10 @@ def delete_workspace(
     workspace_git_service.delete_sync_meta(meta.workspace_name)
     workspace_note_service.delete_note(meta.workspace_id)
     workspace_note_service.delete_note(meta.workspace_name)
+    # 同时按 workspace_id 与 workspace_name 清理 ACL，避免注册表删除后遗留脏授权。
+    # 否则会出现 can_access_workspace=True 但 resolve_workspace_reference=not found 的异常状态。
     auth_service.remove_workspace_access_for_all_users(meta.workspace_id)
+    auth_service.remove_workspace_access_for_all_users(meta.workspace_name)
 
     return WorkspaceDeleteResponse(
         workspace=workspace,
