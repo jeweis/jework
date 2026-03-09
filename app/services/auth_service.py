@@ -574,6 +574,28 @@ class AuthService:
             )
             conn.commit()
 
+    def remove_workspace_access_for_user(self, user_id: int, workspace: str) -> None:
+        """
+        清理单个用户对某个 workspace 的授权残留（兼容 id/name 双键）。
+        """
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.execute(
+                """
+                DELETE FROM user_workspace_access
+                WHERE user_id = ?
+                  AND (
+                        workspace = ?
+                     OR workspace IN (
+                            SELECT workspace_name
+                            FROM workspace_registry
+                            WHERE workspace_id = ?
+                       )
+                  )
+                """,
+                (user_id, workspace, workspace),
+            )
+            conn.commit()
+
     def _query_user_workspace_access_map(
         self, conn: sqlite3.Connection
     ) -> dict[int, list[str]]:

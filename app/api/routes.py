@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.api.deps import get_current_user
-from app.core.errors import AppError, AuthForbiddenError
+from app.core.errors import AppError, AuthForbiddenError, WorkspaceNotFoundError
 from app.models.schemas import (
     AdminResetUserPasswordRequest,
     BootstrapRequest,
@@ -1529,10 +1529,16 @@ def _resolve_workspace_with_access(workspace: str, current_user: AuthUser):
     allowed_ids = None
     if current_user.role != "superadmin":
         allowed_ids = set(auth_service.get_accessible_workspaces(current_user))
-    meta = workspace_service.resolve_workspace_reference(
-        workspace,
-        allowed_workspace_ids=allowed_ids,
-    )
+    try:
+        meta = workspace_service.resolve_workspace_reference(
+            workspace,
+            allowed_workspace_ids=allowed_ids,
+        )
+    except WorkspaceNotFoundError:
+        # 历史脏 ACL 兜底自愈：若 workspace 已不存在，移除当前用户残留授权，避免重复报错。
+        if current_user.role != "superadmin":
+            auth_service.remove_workspace_access_for_user(current_user.id, workspace)
+        raise
     return meta, workspace_service.get_workspace_path(meta.workspace_id)
 
 
