@@ -13,6 +13,7 @@ from app.services.workspace_credential_service import (
     WorkspaceCredentialService,
     workspace_credential_service,
 )
+from app.services.workspace_service import workspace_service
 
 
 @dataclass(frozen=True)
@@ -381,7 +382,24 @@ class WorkspaceBranchService:
     def _workspace_git_credential(self, workspace: str) -> tuple[str | None, str | None]:
         if self._credential_service is None:
             return None, None
+        # 与 pull 流程保持一致：
+        # 1) 优先按当前入参直接查（可能是 workspace_id 或历史 workspace_name）
+        # 2) 若未命中，再解析出 workspace 元信息后按 id/name 双键回退
+        #    避免“能 pull 但分支接口拿不到凭据”的行为不一致。
         detail = self._credential_service.get_workspace_credential_detail(workspace)
+        if detail is None:
+            try:
+                meta = workspace_service.get_workspace_meta(workspace)
+            except Exception:
+                meta = None
+            if meta is not None:
+                detail = self._credential_service.get_workspace_credential_detail(
+                    meta.workspace_id
+                )
+                if detail is None:
+                    detail = self._credential_service.get_workspace_credential_detail(
+                        meta.workspace_name
+                    )
         if detail is None:
             return None, None
         return detail.git_username, detail.git_pat
