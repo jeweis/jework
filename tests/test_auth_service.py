@@ -1,6 +1,11 @@
 import pytest
 
-from app.core.errors import AuthInvalidCredentialsError, AuthRequiredError
+from app.core.errors import (
+    AppError,
+    AuthForbiddenError,
+    AuthInvalidCredentialsError,
+    AuthRequiredError,
+)
 from app.services.auth_service import AuthUser, AuthService
 
 
@@ -35,6 +40,273 @@ def test_superadmin_can_create_user(tmp_path):
     assert isinstance(created, AuthUser)
     assert created.role == "user"
     assert created.has_local_password is True
+
+
+def test_superadmin_can_create_admin_user(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    admin = service.bootstrap_superadmin("admin", "password123")
+    created = service.create_user(
+        admin,
+        "manager01",
+        "password123",
+        role="admin",
+    )
+
+    assert isinstance(created, AuthUser)
+    assert created.role == "admin"
+    assert created.has_local_password is True
+
+
+def test_admin_can_create_normal_user(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager08",
+        "password123",
+        role="admin",
+    )
+
+    created = service.create_user(manager, "user07", "password123")
+
+    assert created.role == "user"
+    assert created.created_by == manager.id
+
+
+def test_admin_cannot_create_admin_user(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager09",
+        "password123",
+        role="admin",
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        service.create_user(
+            manager,
+            "manager10",
+            "password123",
+            role="admin",
+        )
+
+    assert exc_info.value.code == "USER_ROLE_ASSIGN_FORBIDDEN"
+
+
+def test_superadmin_can_update_user_role_to_admin(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    created = service.create_user(superadmin, "user03", "password123")
+
+    updated = service.set_user_role(
+        current_user=superadmin,
+        user_id=created.id,
+        role="admin",
+    )
+
+    assert updated.role == "admin"
+    users = service.list_users(superadmin)
+    target = next(item for item in users if item.id == created.id)
+    assert target.role == "admin"
+
+
+def test_admin_can_list_users(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager03",
+        "password123",
+        role="admin",
+    )
+
+    users = service.list_users(manager)
+
+    assert {item.username for item in users} >= {"admin", "manager03"}
+
+
+def test_admin_can_update_normal_user_workspace_access(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager04",
+        "password123",
+        role="admin",
+    )
+    user = service.create_user(superadmin, "user06", "password123")
+
+    updated = service.set_user_workspace_access(
+        current_user=manager,
+        user_id=user.id,
+        workspace_names=["alpha", "beta"],
+    )
+
+    assert updated == ["alpha", "beta"]
+
+
+def test_admin_cannot_update_admin_workspace_access(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager05",
+        "password123",
+        role="admin",
+    )
+    other_admin = service.create_user(
+        superadmin,
+        "manager06",
+        "password123",
+        role="admin",
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        service.set_user_workspace_access(
+            current_user=manager,
+            user_id=other_admin.id,
+            workspace_names=["alpha"],
+        )
+
+    assert exc_info.value.code == "WORKSPACE_ASSIGNMENT_TARGET_FORBIDDEN"
+
+
+def test_admin_has_global_workspace_access(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager07",
+        "password123",
+        role="admin",
+    )
+
+    assert service.get_accessible_workspaces(manager) == []
+    assert service.can_access_workspace(manager, "any-workspace") is True
+
+
+def test_admin_can_delete_self_created_normal_user(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager11",
+        "password123",
+        role="admin",
+    )
+    created = service.create_user(manager, "user08", "password123")
+
+    service.delete_user(current_user=manager, user_id=created.id)
+
+    users = service.list_users(superadmin)
+    assert "user08" not in {item.username for item in users}
+
+
+def test_admin_cannot_delete_user_created_by_others(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager12",
+        "password123",
+        role="admin",
+    )
+    other_user = service.create_user(superadmin, "user09", "password123")
+
+    with pytest.raises(AppError) as exc_info:
+        service.delete_user(current_user=manager, user_id=other_user.id)
+
+    assert exc_info.value.code == "USER_DELETE_FORBIDDEN"
+
+
+def test_superadmin_can_delete_admin_user(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager13",
+        "password123",
+        role="admin",
+    )
+
+    service.delete_user(current_user=superadmin, user_id=manager.id)
+
+    users = service.list_users(superadmin)
+    assert "manager13" not in {item.username for item in users}
+
+
+def test_non_superadmin_cannot_update_user_role(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    manager = service.create_user(
+        superadmin,
+        "manager02",
+        "password123",
+        role="admin",
+    )
+    target = service.create_user(superadmin, "user04", "password123")
+
+    with pytest.raises(AuthForbiddenError):
+        service.set_user_role(
+            current_user=manager,
+            user_id=target.id,
+            role="admin",
+        )
+
+
+def test_set_user_role_rejects_invalid_role(tmp_path):
+    db_path = tmp_path / "app.db"
+    service = AuthService(str(db_path))
+    service.init_db()
+
+    superadmin = service.bootstrap_superadmin("admin", "password123")
+    target = service.create_user(superadmin, "user05", "password123")
+
+    with pytest.raises(AppError) as exc_info:
+        service.set_user_role(
+            current_user=superadmin,
+            user_id=target.id,
+            role="owner",
+        )
+
+    assert exc_info.value.code == "USER_ROLE_INVALID"
 
 
 def test_feishu_first_login_and_relogin_updates_profile(tmp_path):

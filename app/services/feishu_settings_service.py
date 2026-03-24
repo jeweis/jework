@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import sqlite3
+import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -163,6 +164,34 @@ class FeishuSettingsService:
                 status_code=400,
             )
         return config
+
+    def build_authorize_url(
+        self,
+        *,
+        redirect_uri: str,
+        state: str | None = None,
+    ) -> str:
+        config = self.assert_login_enabled()
+        normalized_redirect_uri = (redirect_uri or "").strip()
+        if not normalized_redirect_uri:
+            raise AppError(
+                code="FEISHU_REDIRECT_URI_REQUIRED",
+                message="redirect_uri is required",
+                status_code=400,
+            )
+        query = {
+            "app_id": config.app_id,
+            "redirect_uri": normalized_redirect_uri,
+            "response_type": "code",
+            "scope": "contact:user.base:readonly",
+        }
+        normalized_state = (state or "").strip()
+        if normalized_state:
+            query["state"] = normalized_state
+        return (
+            f"{config.base_url.rstrip('/')}/open-apis/authen/v1/authorize?"
+            f"{urllib.parse.urlencode(query)}"
+        )
 
     def _upsert_setting(
         self,

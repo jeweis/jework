@@ -46,17 +46,20 @@ _SERVER_INSTRUCTIONS = """
 服务用途是读取与检索工作空间内容，用于理解实现逻辑、配置与文档；不提供写入或代码修改能力。
 
 使用规则：
-1. 先调用 list_workspaces 获取可访问工作空间及备注（name + note）。
+1. 先调用 list_workspaces 获取可访问工作空间及备注（name + note）；若是 Git 工作空间，还会返回最近一次拉取时间 last_pull_at。
 2. 当前入口可能是多工作空间(/mcp)或绑定工作空间(/mcp/{workspace})。
 3. 在多工作空间入口，调用 list_files/read_file/grep_files/semantic_search/hybrid_search 时应显式传 workspace。
-4. 在绑定入口，工具默认作用于绑定工作空间；workspace 参数可省略，若传入必须一致。
-5. semantic_search 若向量不可用，建议回退 grep_files + read_file。
+4. 当需要查看 Git 提交历史时，可使用 search_git_commits / get_git_commit_detail，但仅 Git 工作空间支持。
+5. 当前 Git 工具只面向“当前工作空间当前检出分支”的历史，不支持切换分支，也不支持指定其它分支。
+6. 在绑定入口，工具默认作用于绑定工作空间；workspace 参数可省略，若传入必须一致。
+7. semantic_search 若向量不可用，建议回退 grep_files + read_file。
 
 你可以完成的典型任务：
 - 快速了解某个模块/目录做什么（list_files + read_file）
 - 根据关键词定位实现位置（grep_files）
 - 根据自然语言问题做跨文件语义召回（semantic_search / hybrid_search）
 - 追溯文档描述对应的代码实现与配置来源（grep_files + read_file + semantic_search）
+- 查询某个时间范围内的 Git 提交记录并按提交查看变更详情（search_git_commits / get_git_commit_detail）
 """.strip()
 
 
@@ -168,6 +171,7 @@ def build_fastmcp_asgi_app():
         name="list_workspaces",
         description=(
             "列出当前可访问的工作空间（name + note）。"
+            "若某个工作空间接入了 Git，还会返回最近一次拉取时间 last_pull_at。"
             "在多工作空间模式下返回全部可访问 workspace；"
             "在绑定工作空间模式下仅返回当前绑定 workspace，并附带绑定模式提示。"
         ),
@@ -325,13 +329,122 @@ def build_fastmcp_asgi_app():
             int,
             Field(description="返回结果数量，默认 8。"),
         ] = 8,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         return _safe_tool_call(
             "semantic_search",
             {
                 "workspace": workspace,
                 "query": query,
                 "top_k": top_k,
+            },
+        )
+
+    @mcp.tool(
+        name="search_git_commits",
+        description=(
+            "按作者与时间范围分页查询“主仓库 + 所有 Git 子模块”中的提交记录。"
+            "适用于回溯某段时间内谁提交了什么、快速定位候选提交。"
+            "仅 Git 工作空间支持。"
+            "必须传 start_time、end_time、page、page_size，author 可选。"
+            "时间范围不能超过 3 个月；若超出范围，应该缩小时间窗口后重试。"
+            "每条结果都会明确返回所属 repo_path、repo_name、current_branch、head_commit、detached；"
+            "若需要查看具体改动，请继续调用 get_git_commit_detail。"
+        ),
+    )
+    def search_git_commits(
+        start_time: Annotated[
+            str,
+            Field(
+                description=(
+                    "开始时间，必填，支持 ISO 日期或 ISO 日期时间，"
+                    "例如 2026-01-01 或 2026-01-01T00:00:00+08:00。"
+                ),
+            ),
+        ],
+        end_time: Annotated[
+            str,
+            Field(
+                description=(
+                    "结束时间，必填，支持 ISO 日期或 ISO 日期时间；"
+                    "与 start_time 的跨度不能超过 3 个月。"
+                ),
+            ),
+        ],
+        page: Annotated[
+            int,
+            Field(
+                description="页码，必填，从 1 开始；必须显式传入，避免一次返回过多提交。",
+            ),
+        ],
+        page_size: Annotated[
+            int,
+            Field(
+                description="每页条数，必填，建议 10-50；必须显式传入，避免上下文过载。",
+            ),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(description=_WORKSPACE_PARAM_DESCRIPTION),
+        ] = None,
+        author: Annotated[
+            str | None,
+            Field(description="作者名过滤，非必填；用于缩小候选提交范围。"),
+        ] = None,
+    ) -> dict[str, Any]:
+        return _safe_tool_call(
+            "search_git_commits",
+            {
+                "workspace": workspace,
+                "author": author,
+                "start_time": start_time,
+                "end_time": end_time,
+                "page": page,
+                "page_size": page_size,
+            },
+        )
+
+    @mcp.tool(
+        name="get_git_commit_detail",
+        description=(
+            "根据 commit_id 查看“主仓库 + 所有 Git 子模块”中某次 Git 提交的详细变更内容。"
+            "适用于在 search_git_commits 找到候选提交后，继续查看提交说明、变更文件和 patch。"
+            "仅 Git 工作空间支持。"
+            "需要先拿到可解析的 commit_id。"
+            "若同一个 commit_id 在多个 git 模块中命中，应补充 repo_path 进行消歧。"
+            "返回内容中的 patch 可能因体积过大而被截断，若已截断应结合 changed_files 继续缩小分析范围。"
+        ),
+    )
+    def get_git_commit_detail(
+        commit_id: Annotated[
+            str,
+            Field(
+                description=(
+                    "提交 ID，必填，支持完整 SHA 或当前仓库中可解析的短 SHA；"
+                    "通常来自 search_git_commits 的返回结果。"
+                ),
+            ),
+        ],
+        workspace: Annotated[
+            str | None,
+            Field(description=_WORKSPACE_PARAM_DESCRIPTION),
+        ] = None,
+        repo_path: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "可选的 Git 模块路径。"
+                    "`.` 表示主仓库；其他值表示某个子模块路径。"
+                    "当 commit_id 在多个模块都命中时，应传入该参数消歧。"
+                ),
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        return _safe_tool_call(
+            "get_git_commit_detail",
+            {
+                "workspace": workspace,
+                "commit_id": commit_id,
+                "repo_path": repo_path,
             },
         )
 

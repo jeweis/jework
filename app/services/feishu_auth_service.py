@@ -31,6 +31,7 @@ class FeishuAuthService:
         app_id: str,
         app_secret: str,
         code: str,
+        redirect_uri: str | None = None,
     ) -> str:
         payload = {
             "grant_type": "authorization_code",
@@ -38,6 +39,9 @@ class FeishuAuthService:
             "client_secret": app_secret,
             "code": code,
         }
+        normalized_redirect_uri = (redirect_uri or "").strip()
+        if normalized_redirect_uri:
+            payload["redirect_uri"] = normalized_redirect_uri
         url = f"{base_url.rstrip('/')}/open-apis/authen/v2/oauth/token"
         data = self._post_json(url, payload)
         self._assert_success(data, error_code="FEISHU_TOKEN_EXCHANGE_FAILED")
@@ -161,4 +165,3 @@ class FeishuAuthService:
 
 
 feishu_auth_service = FeishuAuthService()
-

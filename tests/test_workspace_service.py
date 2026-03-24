@@ -1,8 +1,5 @@
 from pathlib import Path
 
-import pytest
-
-from app.core.errors import WorkspaceAlreadyExistsError
 from app.services.workspace_service import WorkspaceService
 
 
@@ -12,6 +9,7 @@ def test_list_workspaces_only_directories(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("x", encoding="utf-8")
 
     service = WorkspaceService(tmp_path)
+    service.init_db()
     names = [item.name for item in service.list_workspaces()]
 
     assert names == ["a", "b"]
@@ -26,12 +24,14 @@ def test_create_workspace_without_git(tmp_path: Path) -> None:
     assert (tmp_path / "demo").exists()
 
 
-def test_create_workspace_duplicate(tmp_path: Path) -> None:
+def test_create_workspace_duplicate_returns_existing_item(tmp_path: Path) -> None:
     service = WorkspaceService(tmp_path)
-    service.create_workspace("demo")
+    first = service.create_workspace("demo")
 
-    with pytest.raises(WorkspaceAlreadyExistsError):
-        service.create_workspace("demo")
+    second = service.create_workspace("demo")
+
+    assert second.workspace_id == first.workspace_id
+    assert second.name == "demo"
 
 
 def test_create_personal_workspace_under_project_dir(tmp_path: Path) -> None:

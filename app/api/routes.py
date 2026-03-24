@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.api.deps import get_current_user
@@ -12,6 +12,7 @@ from app.models.schemas import (
     AdminResetUserPasswordRequest,
     BootstrapRequest,
     BootstrapStatusResponse,
+    FeishuAuthorizeUrlResponse,
     SetLocalPasswordRequest,
     FeishuLoginRequest,
     FeishuSettingsItem,
@@ -19,6 +20,7 @@ from app.models.schemas import (
     CreateLlmConfigRequest,
     CreateSessionRequest,
     CreateSessionResponse,
+    DeleteUserResponse,
     DeleteSessionResponse,
     CreateUserRequest,
     CreateWorkspaceRequest,
@@ -40,19 +42,26 @@ from app.models.schemas import (
     SessionMessageItem,
     SessionSummaryItem,
     UpdateLlmConfigRequest,
+    UpdateWorkspaceAutoPullSettingsRequest,
     UpdateUserWorkspaceAccessRequest,
+    UpdateUserRoleRequest,
     UpdateFeishuSettingsRequest,
     UpdateWorkspaceCredentialRequest,
     UpdateWorkspaceAgentProfileRequest,
     UpdateWorkspaceNoteRequest,
+    UpdateWorkspaceTagsRequest,
+    UpdateUserWorkspacePreferenceRequest,
     UserListResponse,
+    UserWorkspacePreferenceItem,
     UserResponse,
     WorkspaceCredentialItem,
     WorkspaceDeleteResponse,
     WorkspaceItem,
     WorkspaceAgentProfileItem,
+    WorkspaceAutoPullSettingsItem,
     WorkspaceListResponse,
     WorkspaceNoteItem,
+    WorkspaceTagsItem,
     WorkspacePullResponse,
     WorkspaceSkillItem,
 )
@@ -74,9 +83,14 @@ from app.services.session_run_service import TERMINAL_RUN_STATUS, session_run_se
 from app.services.session_service import session_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
+from app.services.workspace_auto_pull_service import workspace_auto_pull_service
 from app.services.workspace_note_service import workspace_note_service
+from app.services.workspace_tag_service import workspace_tag_service
 from app.services.workspace_agent_profile_service import workspace_agent_profile_service
 from app.services.workspace_service import workspace_service
+from app.services.user_workspace_preference_service import (
+    user_workspace_preference_service,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -98,6 +112,7 @@ def bootstrap(body: BootstrapRequest) -> UserResponse:
         display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
+        created_by=user.created_by,
         has_local_password=user.has_local_password,
         accessible_workspaces=[],
     )
@@ -115,6 +130,7 @@ def login(body: LoginRequest) -> LoginResponse:
             display_name=user.display_name,
             role=user.role,
             created_at=user.created_at,
+            created_by=user.created_by,
             has_local_password=user.has_local_password,
             accessible_workspaces=accessible,
         ),
@@ -127,6 +143,22 @@ def feishu_status() -> FeishuStatusResponse:
     return FeishuStatusResponse(enabled=status.enabled, app_id=status.app_id)
 
 
+@router.get(
+    "/auth/feishu/authorize-url",
+    response_model=FeishuAuthorizeUrlResponse,
+)
+def feishu_authorize_url(
+    redirect_uri: str = Query(..., min_length=1, max_length=2048),
+    state: str | None = Query(default=None, max_length=2048),
+) -> FeishuAuthorizeUrlResponse:
+    return FeishuAuthorizeUrlResponse(
+        authorize_url=feishu_settings_service.build_authorize_url(
+            redirect_uri=redirect_uri,
+            state=state,
+        )
+    )
+
+
 @router.post("/auth/feishu/login", response_model=LoginResponse)
 def feishu_login(body: FeishuLoginRequest) -> LoginResponse:
     config = feishu_settings_service.assert_login_enabled()
@@ -135,6 +167,7 @@ def feishu_login(body: FeishuLoginRequest) -> LoginResponse:
         app_id=config.app_id or "",
         app_secret=config.app_secret or "",
         code=body.code,
+        redirect_uri=body.redirect_uri,
     )
     user_info = feishu_auth_service.get_user_info(
         base_url=config.base_url,
@@ -156,6 +189,7 @@ def feishu_login(body: FeishuLoginRequest) -> LoginResponse:
             display_name=user.display_name,
             role=user.role,
             created_at=user.created_at,
+            created_by=user.created_by,
             has_local_password=user.has_local_password,
             accessible_workspaces=accessible,
         ),
@@ -171,6 +205,7 @@ def get_me(current_user: AuthUser = Depends(get_current_user)) -> UserResponse:
         display_name=current_user.display_name,
         role=current_user.role,
         created_at=current_user.created_at,
+        created_by=current_user.created_by,
         has_local_password=current_user.has_local_password,
         accessible_workspaces=accessible,
     )
@@ -199,6 +234,7 @@ def list_users(current_user: AuthUser = Depends(get_current_user)) -> UserListRe
                 display_name=user.display_name,
                 role=user.role,
                 created_at=user.created_at,
+                created_by=user.created_by,
                 has_local_password=user.has_local_password,
                 accessible_workspaces=user.accessible_workspaces or [],
             )
@@ -267,6 +303,7 @@ def create_user(
         current_user=current_user,
         username=body.username,
         password=body.password,
+        role=body.role,
         workspace_names=sorted(set(normalized_ids)),
     )
     return UserResponse(
@@ -275,8 +312,34 @@ def create_user(
         display_name=user.display_name,
         role=user.role,
         created_at=user.created_at,
+        created_by=user.created_by,
         has_local_password=user.has_local_password,
         accessible_workspaces=user.accessible_workspaces or [],
+    )
+
+
+@router.put("/users/{user_id}/role", response_model=UserResponse)
+def update_user_role(
+    user_id: int,
+    body: UpdateUserRoleRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> UserResponse:
+    target = auth_service.set_user_role(
+        current_user=current_user,
+        user_id=user_id,
+        role=body.role,
+    )
+    users = auth_service.list_users(current_user)
+    enriched = next((item for item in users if item.id == user_id), target)
+    return UserResponse(
+        id=enriched.id,
+        username=enriched.username,
+        display_name=enriched.display_name,
+        role=enriched.role,
+        created_at=enriched.created_at,
+        created_by=enriched.created_by,
+        has_local_password=enriched.has_local_password,
+        accessible_workspaces=enriched.accessible_workspaces or [],
     )
 
 
@@ -313,8 +376,21 @@ def update_user_workspaces(
         display_name=target.display_name,
         role=target.role,
         created_at=target.created_at,
+        created_by=target.created_by,
         has_local_password=target.has_local_password,
         accessible_workspaces=[] if target.role == "superadmin" else accessible,
+    )
+
+
+@router.delete("/users/{user_id}", response_model=DeleteUserResponse)
+def delete_user(
+    user_id: int,
+    current_user: AuthUser = Depends(get_current_user),
+) -> DeleteUserResponse:
+    auth_service.delete_user(current_user=current_user, user_id=user_id)
+    return DeleteUserResponse(
+        user_id=user_id,
+        deleted_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -454,8 +530,85 @@ def list_workspaces(
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceListResponse:
     accessible = auth_service.get_accessible_workspaces(current_user)
-    allowed = None if current_user.role == "superadmin" else set(accessible)
+    allowed = None if current_user.role in {"superadmin", "admin"} else set(accessible)
     return WorkspaceListResponse(items=workspace_service.list_workspaces(allowed))
+
+
+@router.get(
+    "/api/user/workspaces/preferences",
+    response_model=UserWorkspacePreferenceItem,
+)
+def get_user_workspace_preferences(
+    current_user: AuthUser = Depends(get_current_user),
+) -> UserWorkspacePreferenceItem:
+    item = user_workspace_preference_service.get_preference(current_user.id)
+    return UserWorkspacePreferenceItem(
+        selected_tags=item.selected_tags,
+        updated_at=item.updated_at,
+    )
+
+
+@router.put(
+    "/api/user/workspaces/preferences",
+    response_model=UserWorkspacePreferenceItem,
+)
+def update_user_workspace_preferences(
+    body: UpdateUserWorkspacePreferenceRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> UserWorkspacePreferenceItem:
+    item = user_workspace_preference_service.update_selected_tags(
+        user_id=current_user.id,
+        selected_tags=body.selected_tags,
+    )
+    return UserWorkspacePreferenceItem(
+        selected_tags=item.selected_tags,
+        updated_at=item.updated_at,
+    )
+
+
+@router.get(
+    "/api/admin/workspaces/auto-pull-settings",
+    response_model=WorkspaceAutoPullSettingsItem,
+)
+def get_workspace_auto_pull_settings(
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAutoPullSettingsItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = workspace_auto_pull_service.get_settings()
+    return WorkspaceAutoPullSettingsItem(
+        enabled=item.enabled,
+        interval_minutes=item.interval_minutes,
+        last_run_at=item.last_run_at,
+        next_run_at=item.next_run_at,
+        updated_by=item.updated_by,
+        updated_at=item.updated_at,
+    )
+
+
+@router.put(
+    "/api/admin/workspaces/auto-pull-settings",
+    response_model=WorkspaceAutoPullSettingsItem,
+)
+def update_workspace_auto_pull_settings(
+    body: UpdateWorkspaceAutoPullSettingsRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceAutoPullSettingsItem:
+    if current_user.role != "superadmin":
+        raise AuthForbiddenError()
+    item = workspace_auto_pull_service.update_settings(
+        enabled=body.enabled,
+        interval_minutes=body.interval_minutes,
+        updated_by=current_user.id,
+    )
+    return WorkspaceAutoPullSettingsItem(
+        enabled=item.enabled,
+        interval_minutes=item.interval_minutes,
+        last_run_at=item.last_run_at,
+        next_run_at=item.next_run_at,
+        updated_by=item.updated_by,
+        updated_at=item.updated_at,
+    )
 
 
 @router.post("/workspaces", response_model=WorkspaceItem)
@@ -465,7 +618,7 @@ def create_workspace(
 ) -> WorkspaceItem:
     mode = body.mode.strip().lower()
     if mode == "team":
-        if current_user.role != "superadmin":
+        if current_user.role not in {"superadmin", "admin"}:
             raise AuthForbiddenError()
         owner_user_id: int | None = None
     elif mode == "personal":
@@ -478,7 +631,7 @@ def create_workspace(
             status_code=400,
         )
 
-    return workspace_service.create_workspace(
+    item = workspace_service.create_workspace(
         workspace=body.name,
         mode=mode,
         git_url=body.git_url,
@@ -487,6 +640,14 @@ def create_workspace(
         creator_user_id=current_user.id,
         owner_user_id=owner_user_id,
     )
+    if body.tags:
+        tags_item = workspace_tag_service.replace_tags(
+            workspace=item.workspace_id,
+            tags=body.tags,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        item.tags = tags_item.tags
+    return item
 
 
 @router.delete("/workspaces/{workspace}", response_model=WorkspaceDeleteResponse)
@@ -512,6 +673,8 @@ def delete_workspace(
     workspace_git_service.delete_sync_meta(meta.workspace_name)
     workspace_note_service.delete_note(meta.workspace_id)
     workspace_note_service.delete_note(meta.workspace_name)
+    workspace_tag_service.delete_tags(meta.workspace_id)
+    workspace_tag_service.delete_tags(meta.workspace_name)
     # 同时按 workspace_id 与 workspace_name 清理 ACL，避免注册表删除后遗留脏授权。
     # 否则会出现 can_access_workspace=True 但 resolve_workspace_reference=not found 的异常状态。
     auth_service.remove_workspace_access_for_all_users(meta.workspace_id)
@@ -572,6 +735,32 @@ def update_workspace_note(
     return WorkspaceNoteItem(
         workspace=meta.workspace_name,
         note=item.note,
+        updated_at=item.updated_at,
+    )
+
+
+@router.put("/workspaces/{workspace}/tags", response_model=WorkspaceTagsItem)
+def update_workspace_tags(
+    workspace: str,
+    body: UpdateWorkspaceTagsRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> WorkspaceTagsItem:
+    meta = workspace_service.get_workspace_meta(workspace)
+    if meta.mode == "team" and current_user.role not in {"superadmin", "admin"}:
+        raise AuthForbiddenError()
+    if meta.mode == "personal":
+        if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:
+            raise AuthForbiddenError()
+    workspace_service.get_workspace_path(meta.workspace_id)
+    updated_at = datetime.now(timezone.utc).isoformat()
+    item = workspace_tag_service.replace_tags(
+        workspace=meta.workspace_id,
+        tags=body.tags,
+        updated_at=updated_at,
+    )
+    return WorkspaceTagsItem(
+        workspace=meta.workspace_name,
+        tags=item.tags,
         updated_at=item.updated_at,
     )
 
@@ -806,7 +995,7 @@ def pull_workspace_git(
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspacePullResponse:
     _require_workspace_access(workspace, current_user)
-    result = workspace_service.pull_workspace(workspace)
+    result = workspace_service.pull_workspace(workspace, trigger_mode="manual")
     # Pull 成功后触发增量索引，让向量库尽快与最新代码对齐。
     try:
         if result.changed and mcp_settings_service.get_settings().mcp_enabled:
@@ -828,6 +1017,8 @@ def pull_workspace_git(
         changed=result.changed,
         summary=result.summary,
         pulled_at=result.pulled_at,
+        trigger_mode=result.trigger_mode,
+        error_detail=result.error_detail,
     )
 
 

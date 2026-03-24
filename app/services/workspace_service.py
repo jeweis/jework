@@ -35,6 +35,10 @@ from app.services.workspace_note_service import (
     WorkspaceNoteService,
     workspace_note_service,
 )
+from app.services.workspace_tag_service import (
+    WorkspaceTagService,
+    workspace_tag_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,49 @@ class WorkspacePullResult:
     changed: bool
     summary: str
     pulled_at: str
+    trigger_mode: str | None = None
+    error_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceGitRepoContext:
+    repo_path: str
+    repo_name: str
+    current_branch: str | None
+    head_commit: str
+    detached: bool
+
+
+@dataclass(frozen=True)
+class WorkspaceGitCommitSummary:
+    commit_id: str
+    subject: str
+    author: str
+    authored_at: str
+    repo: WorkspaceGitRepoContext
+
+
+@dataclass(frozen=True)
+class WorkspaceGitCommitSearchResult:
+    workspace: str
+    page: int
+    page_size: int
+    items: list[WorkspaceGitCommitSummary]
+    has_more: bool
+
+
+@dataclass(frozen=True)
+class WorkspaceGitCommitDetail:
+    workspace: str
+    commit_id: str
+    author: str
+    authored_at: str
+    subject: str
+    body: str
+    repo: WorkspaceGitRepoContext
+    changed_files: list[str]
+    patch: str
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -72,12 +119,14 @@ class WorkspaceService:
         credential_service: WorkspaceCredentialService | None = None,
         git_service: WorkspaceGitService | None = None,
         note_service: WorkspaceNoteService | None = None,
+        tag_service: WorkspaceTagService | None = None,
     ):
         self._root_dir = root_dir
         self._db_path = str(settings.sqlite_db_path)
         self._credential_service = credential_service
         self._git_service = git_service
         self._note_service = note_service
+        self._tag_service = tag_service
         self._personal_root_relative = "personal"
         # 主个人 Agent 的目录名，固定为 workspace。
         self._personal_main_agent_root_relative = "workspace"
@@ -105,6 +154,7 @@ class WorkspaceService:
         )
         git_meta_map = self._git_service.get_sync_meta_map() if self._git_service else {}
         note_map = self._note_service.list_notes() if self._note_service else {}
+        tag_map = self._tag_service.list_tags() if self._tag_service else {}
 
         items: list[WorkspaceItem] = []
         for meta in meta_map.values():
@@ -124,6 +174,7 @@ class WorkspaceService:
                 meta.workspace_name
             )
             note = note_map.get(meta.workspace_id) or note_map.get(meta.workspace_name)
+            tags_item = tag_map.get(meta.workspace_id) or tag_map.get(meta.workspace_name)
             items.append(
                 WorkspaceItem(
                     workspace_id=meta.workspace_id,
@@ -132,11 +183,19 @@ class WorkspaceService:
                     mode=meta.mode,
                     owner_user_id=meta.owner_user_id,
                     note=note.note if note else None,
+                    tags=tags_item.tags if tags_item else [],
                     git_url=credential.git_url if credential else None,
                     git_username=credential.git_username if credential else None,
                     has_git_pat=credential.has_git_pat if credential else False,
                     last_pull_at=git_meta.last_pull_at if git_meta else None,
                     last_pull_status=git_meta.last_pull_status if git_meta else None,
+                    last_pull_message=git_meta.last_pull_message if git_meta else None,
+                    last_pull_trigger_mode=(
+                        git_meta.last_pull_trigger_mode if git_meta else None
+                    ),
+                    last_pull_error_detail=(
+                        git_meta.last_pull_error_detail if git_meta else None
+                    ),
                 )
             )
         return sorted(items, key=lambda x: x.name)
@@ -339,6 +398,7 @@ class WorkspaceService:
             path=str(target),
             mode=normalized_mode,
             owner_user_id=resolved_owner_user_id,
+            tags=[],
             git_url=normalized_url,
             git_username=normalized_user,
             has_git_pat=bool(normalized_pat),
@@ -352,15 +412,23 @@ class WorkspaceService:
             credential = credential_map.get(meta.workspace_id) or credential_map.get(
                 meta.workspace_name
             )
+        tags_item = None
+        if self._tag_service is not None:
+            tag_map = self._tag_service.list_tags()
+            tags_item = tag_map.get(meta.workspace_id) or tag_map.get(meta.workspace_name)
         return WorkspaceItem(
             workspace_id=meta.workspace_id,
             name=meta.workspace_name,
             path=str(target),
             mode=meta.mode,
             owner_user_id=meta.owner_user_id,
+            tags=tags_item.tags if tags_item else [],
             git_url=credential.git_url if credential else None,
             git_username=credential.git_username if credential else None,
             has_git_pat=credential.has_git_pat if credential else False,
+            last_pull_message=None,
+            last_pull_trigger_mode=None,
+            last_pull_error_detail=None,
         )
 
     def _clone_repo(
@@ -869,7 +937,12 @@ class WorkspaceService:
         )
         conn.commit()
 
-    def pull_workspace(self, workspace: str) -> WorkspacePullResult:
+    def pull_workspace(
+        self,
+        workspace: str,
+        *,
+        trigger_mode: str = "manual",
+    ) -> WorkspacePullResult:
         meta = self.get_workspace_meta(workspace)
         target = self._resolve_workspace_path(meta)
         git_dir = (target / ".git").resolve()
@@ -941,6 +1014,8 @@ class WorkspaceService:
                     workspace=meta.workspace_id,
                     status="success",
                     message=summary,
+                    trigger_mode=trigger_mode,
+                    error_detail=None,
                     pulled_at=pulled_at,
                 )
             return WorkspacePullResult(
@@ -950,15 +1025,181 @@ class WorkspaceService:
                 changed=changed,
                 summary=summary,
                 pulled_at=pulled_at,
+                trigger_mode=trigger_mode,
+                error_detail=None,
             )
         except WorkspaceCreateError as exc:
+            reason = str(exc.details.get("reason") if exc.details else str(exc))
             if self._git_service is not None:
                 self._git_service.set_pull_result(
                     workspace=meta.workspace_id,
                     status="failed",
-                    message=str(exc.details.get("reason") if exc.details else str(exc)),
+                    message="拉取失败",
+                    trigger_mode=trigger_mode,
+                    error_detail=reason,
                 )
-            raise
+            return WorkspacePullResult(
+                workspace=meta.workspace_name,
+                before_commit=None,
+                after_commit=None,
+                changed=False,
+                summary="拉取失败",
+                pulled_at=datetime.now(timezone.utc).isoformat(),
+                trigger_mode=trigger_mode,
+                error_detail=reason,
+            )
+
+    def search_git_commits(
+        self,
+        workspace: str,
+        *,
+        start_time: str,
+        end_time: str,
+        page: int,
+        page_size: int,
+        author: str | None = None,
+    ) -> WorkspaceGitCommitSearchResult:
+        meta, target, username, pat = self._prepare_git_workspace(workspace)
+        normalized_author = self._normalize_optional(author)
+        modules = self._list_git_modules(
+            root_repo_dir=target,
+            git_username=username,
+            git_pat=pat,
+        )
+        items: list[WorkspaceGitCommitSummary] = []
+        for module in modules:
+            git_args = [
+                "log",
+                "--date=iso-strict",
+                f"--since={start_time}",
+                f"--until={end_time}",
+                "--pretty=format:%H%x1f%an%x1f%aI%x1f%s",
+            ]
+            if normalized_author:
+                git_args.append(f"--author={normalized_author}")
+            output = self._run_git(
+                module["repo_dir"],
+                git_args,
+                git_username=username,
+                git_pat=pat,
+            )
+            rows = [line for line in output.splitlines() if line.strip()]
+            for row in rows:
+                parts = row.split("\x1f")
+                if len(parts) != 4:
+                    continue
+                items.append(
+                    WorkspaceGitCommitSummary(
+                        commit_id=parts[0],
+                        author=parts[1],
+                        authored_at=parts[2],
+                        subject=parts[3],
+                        repo=module["context"],
+                    )
+                )
+        items.sort(
+            key=lambda item: (
+                item.authored_at,
+                item.commit_id,
+                item.repo.repo_path,
+            ),
+            reverse=True,
+        )
+        skip = (page - 1) * page_size
+        has_more = len(items) > skip + page_size
+        return WorkspaceGitCommitSearchResult(
+            workspace=meta.workspace_name,
+            page=page,
+            page_size=page_size,
+            items=items[skip : skip + page_size],
+            has_more=has_more,
+        )
+
+    def get_git_commit_detail(
+        self,
+        workspace: str,
+        *,
+        commit_id: str,
+        repo_path: str | None = None,
+        max_patch_chars: int = 120_000,
+    ) -> WorkspaceGitCommitDetail:
+        meta, target, username, pat = self._prepare_git_workspace(workspace)
+        normalized_commit_id = commit_id.strip()
+        if not normalized_commit_id:
+            raise WorkspaceCreateError(workspace, "commit_id is required")
+        matches = self._find_git_commit_matches(
+            root_repo_dir=target,
+            commit_id=normalized_commit_id,
+            repo_path=repo_path,
+            git_username=username,
+            git_pat=pat,
+        )
+        if not matches:
+            raise WorkspaceCreateError(workspace, "commit not found in workspace git modules")
+        if len(matches) > 1:
+            matched_paths = ", ".join(match["context"].repo_path for match in matches)
+            raise WorkspaceCreateError(
+                workspace,
+                f"commit matches multiple git modules: {matched_paths}",
+            )
+        matched = matches[0]
+        summary_output = self._run_git(
+            matched["repo_dir"],
+            [
+                "show",
+                "--no-patch",
+                "--date=iso-strict",
+                "--format=%H%x1f%an%x1f%aI%x1f%s%x1f%b",
+                normalized_commit_id,
+            ],
+            git_username=username,
+            git_pat=pat,
+        )
+        summary_parts = summary_output.split("\x1f", maxsplit=4)
+        if len(summary_parts) < 4:
+            raise WorkspaceCreateError(workspace, "failed to parse commit summary")
+        if len(summary_parts) == 4:
+            summary_parts.append("")
+
+        files_output = self._run_git(
+            matched["repo_dir"],
+            [
+                "show",
+                "--no-commit-id",
+                "--name-only",
+                "--format=",
+                normalized_commit_id,
+            ],
+            git_username=username,
+            git_pat=pat,
+        )
+        changed_files = [line.strip() for line in files_output.splitlines() if line.strip()]
+
+        patch_output = self._run_git(
+            matched["repo_dir"],
+            [
+                "show",
+                "--format=",
+                normalized_commit_id,
+            ],
+            git_username=username,
+            git_pat=pat,
+        )
+        truncated = len(patch_output) > max_patch_chars
+        patch = patch_output[:max_patch_chars] if truncated else patch_output
+
+        return WorkspaceGitCommitDetail(
+            workspace=meta.workspace_name,
+            commit_id=summary_parts[0],
+            author=summary_parts[1],
+            authored_at=summary_parts[2],
+            subject=summary_parts[3],
+            body=summary_parts[4].strip(),
+            repo=matched["context"],
+            changed_files=changed_files,
+            patch=patch,
+            truncated=truncated,
+        )
 
     def delete_workspace(self, workspace: str) -> WorkspaceDeleteResult:
         meta = self.get_workspace_meta(workspace)
@@ -1018,6 +1259,124 @@ class WorkspaceService:
         except subprocess.CalledProcessError as exc:
             reason = (exc.stderr or exc.stdout or "git command failed").strip()
             raise WorkspaceCreateError(cwd.name, reason) from exc
+
+    def _prepare_git_workspace(
+        self,
+        workspace: str,
+    ) -> tuple[WorkspaceMeta, Path, str | None, str | None]:
+        meta = self.get_workspace_meta(workspace)
+        target = self._resolve_workspace_path(meta)
+        git_dir = (target / ".git").resolve()
+        if not git_dir.exists():
+            raise WorkspaceCreateError(workspace, "workspace is not a git repository")
+
+        detail = None
+        if self._credential_service is not None:
+            detail = self._credential_service.get_workspace_credential_detail(
+                meta.workspace_id
+            )
+            if detail is None:
+                detail = self._credential_service.get_workspace_credential_detail(
+                    meta.workspace_name
+                )
+        username = detail.git_username if detail else None
+        pat = detail.git_pat if detail else None
+        if detail and detail.git_url:
+            self._validate_pat_support(git_url=detail.git_url, git_pat=pat)
+        return meta, target, username, pat
+
+    def _list_git_modules(
+        self,
+        *,
+        root_repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> list[dict[str, Path | WorkspaceGitRepoContext]]:
+        modules: list[dict[str, Path | WorkspaceGitRepoContext]] = []
+
+        def collect(repo_dir: Path, repo_path: str) -> None:
+            context = self._build_git_repo_context(
+                repo_dir=repo_dir,
+                repo_path=repo_path,
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            modules.append({"repo_dir": repo_dir, "context": context})
+
+            for sub_path in self._list_submodule_paths(repo_dir=repo_dir):
+                nested_repo_dir = (repo_dir / sub_path).resolve()
+                if not (nested_repo_dir / ".git").exists():
+                    continue
+                nested_repo_path = (
+                    sub_path if repo_path == "." else f"{repo_path}/{sub_path}"
+                )
+                collect(nested_repo_dir, nested_repo_path)
+
+        collect(root_repo_dir, ".")
+        return modules
+
+    def _build_git_repo_context(
+        self,
+        *,
+        repo_dir: Path,
+        repo_path: str,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> WorkspaceGitRepoContext:
+        branch_name = self._run_git(
+            repo_dir,
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+        head_commit = self._run_git(
+            repo_dir,
+            ["rev-parse", "HEAD"],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+        detached = branch_name == "HEAD"
+        return WorkspaceGitRepoContext(
+            repo_path=repo_path,
+            repo_name="root" if repo_path == "." else repo_path,
+            current_branch=None if detached else branch_name,
+            head_commit=head_commit,
+            detached=detached,
+        )
+
+    def _find_git_commit_matches(
+        self,
+        *,
+        root_repo_dir: Path,
+        commit_id: str,
+        repo_path: str | None,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> list[dict[str, Path | WorkspaceGitRepoContext]]:
+        normalized_repo_path = self._normalize_optional(repo_path)
+        matches: list[dict[str, Path | WorkspaceGitRepoContext]] = []
+        for module in self._list_git_modules(
+            root_repo_dir=root_repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        ):
+            context = module["context"]
+            assert isinstance(context, WorkspaceGitRepoContext)
+            if normalized_repo_path and context.repo_path != normalized_repo_path:
+                continue
+            repo_dir = module["repo_dir"]
+            assert isinstance(repo_dir, Path)
+            try:
+                self._run_git(
+                    repo_dir,
+                    ["rev-parse", "--verify", f"{commit_id}^{{commit}}"],
+                    git_username=git_username,
+                    git_pat=git_pat,
+                )
+            except WorkspaceCreateError:
+                continue
+            matches.append(module)
+        return matches
 
     def _normalize_optional(self, value: str | None) -> str | None:
         if value is None:
@@ -1172,4 +1531,5 @@ workspace_service = WorkspaceService(
     credential_service=workspace_credential_service,
     git_service=workspace_git_service,
     note_service=workspace_note_service,
+    tag_service=workspace_tag_service,
 )

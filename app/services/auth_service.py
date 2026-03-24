@@ -19,6 +19,7 @@ from app.core.errors import (
 )
 
 _USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
+_ALLOWED_ASSIGNABLE_ROLES = {"user", "admin"}
 
 
 @dataclass
@@ -27,6 +28,7 @@ class AuthUser:
     username: str
     role: str
     created_at: str
+    created_by: int | None = None
     has_local_password: bool = True
     display_name: str | None = None
     avatar_url: str | None = None
@@ -51,6 +53,7 @@ class AuthService:
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    created_by INTEGER,
                     has_local_password INTEGER NOT NULL DEFAULT 1
                 )
                 """
@@ -121,7 +124,7 @@ class AuthService:
             row = conn.execute(
                 """
                 SELECT id, username, password_hash, role, created_at,
-                       has_local_password, display_name, avatar_url,
+                       created_by, has_local_password, display_name, avatar_url,
                        feishu_union_id, feishu_open_id
                 FROM users
                 WHERE username = ?
@@ -150,6 +153,7 @@ class AuthService:
                 username=row["username"],
                 role=row["role"],
                 created_at=row["created_at"],
+                created_by=row["created_by"],
                 has_local_password=bool(row["has_local_password"]),
                 display_name=row["display_name"],
                 avatar_url=row["avatar_url"],
@@ -176,7 +180,7 @@ class AuthService:
             row = conn.execute(
                 """
                 SELECT id, username, role, created_at,
-                       has_local_password, display_name, avatar_url,
+                       created_by, has_local_password, display_name, avatar_url,
                        feishu_union_id, feishu_open_id
                 FROM users
                 WHERE feishu_union_id = ?
@@ -193,16 +197,17 @@ class AuthService:
                     """
                     INSERT INTO users (
                         username, password_hash, role, created_at,
-                        has_local_password, display_name, avatar_url,
+                        created_by, has_local_password, display_name, avatar_url,
                         feishu_union_id, feishu_open_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         username,
                         password_hash,
                         "user",
                         now_text,
+                        None,
                         0,
                         name,
                         avatar_url,
@@ -231,6 +236,7 @@ class AuthService:
                     username=username,
                     role="user",
                     created_at=now_text,
+                    created_by=None,
                     has_local_password=False,
                     display_name=name,
                     avatar_url=avatar_url,
@@ -251,6 +257,7 @@ class AuthService:
                     username=row["username"],
                     role=row["role"],
                     created_at=row["created_at"],
+                    created_by=row["created_by"],
                     has_local_password=bool(row["has_local_password"]),
                     display_name=name,
                     avatar_url=avatar_url,
@@ -276,7 +283,7 @@ class AuthService:
             row = conn.execute(
                 """
                 SELECT u.id, u.username, u.role, u.created_at, t.expires_at,
-                       u.has_local_password, u.display_name, u.avatar_url,
+                       u.created_by, u.has_local_password, u.display_name, u.avatar_url,
                        u.feishu_union_id, u.feishu_open_id
                 FROM auth_tokens t
                 JOIN users u ON u.id = t.user_id
@@ -298,6 +305,7 @@ class AuthService:
                 username=row["username"],
                 role=row["role"],
                 created_at=row["created_at"],
+                created_by=row["created_by"],
                 has_local_password=bool(row["has_local_password"]),
                 display_name=row["display_name"],
                 avatar_url=row["avatar_url"],
@@ -311,7 +319,7 @@ class AuthService:
             row = conn.execute(
                 """
                 SELECT id, username, role, created_at,
-                       has_local_password, display_name, avatar_url,
+                       created_by, has_local_password, display_name, avatar_url,
                        feishu_union_id, feishu_open_id
                 FROM users
                 WHERE id = ?
@@ -326,6 +334,7 @@ class AuthService:
                 username=row["username"],
                 role=row["role"],
                 created_at=row["created_at"],
+                created_by=row["created_by"],
                 has_local_password=bool(row["has_local_password"]),
                 display_name=row["display_name"],
                 avatar_url=row["avatar_url"],
@@ -338,13 +347,22 @@ class AuthService:
         current_user: AuthUser,
         username: str,
         password: str,
+        role: str = "user",
         workspace_names: list[str] | None = None,
     ) -> AuthUser:
-        if current_user.role != "superadmin":
+        if current_user.role not in {"superadmin", "admin"}:
             raise AuthForbiddenError()
 
         self._validate_username(username)
         self._validate_password(password)
+        normalized_role = self._normalize_assignable_role(role)
+        if current_user.role == "admin" and normalized_role != "user":
+            raise AppError(
+                code="USER_ROLE_ASSIGN_FORBIDDEN",
+                message="Admin can only create normal users",
+                details={"role": normalized_role},
+                status_code=403,
+            )
 
         now = datetime.now(timezone.utc).isoformat()
         password_hash = self._hash_password(password)
@@ -353,11 +371,19 @@ class AuthService:
             with closing(sqlite3.connect(self._db_path)) as conn:
                 cursor = conn.execute(
                     """
-                INSERT INTO users (username, password_hash, role, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO users (
+                    username, password_hash, role, created_at, created_by
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (username, password_hash, "user", now),
-            )
+                    (
+                        username,
+                        password_hash,
+                        normalized_role,
+                        now,
+                        current_user.id,
+                    ),
+                )
                 user_id = int(cursor.lastrowid)
                 workspace_rows = [
                     (user_id, workspace, now, now)
@@ -379,21 +405,23 @@ class AuthService:
         return AuthUser(
             id=user_id,
             username=username,
-            role="user",
+            role=normalized_role,
             created_at=now,
+            created_by=current_user.id,
             has_local_password=True,
             accessible_workspaces=sorted(set(workspace_names or [])),
         )
 
     def list_users(self, current_user: AuthUser) -> list[AuthUser]:
-        if current_user.role != "superadmin":
+        if current_user.role not in {"superadmin", "admin"}:
             raise AuthForbiddenError()
 
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT id, username, role, created_at, has_local_password, display_name
+                SELECT id, username, role, created_at, created_by,
+                       has_local_password, display_name
                 FROM users
                 ORDER BY id ASC
                 """
@@ -406,8 +434,11 @@ class AuthService:
                     display_name=row["display_name"],
                     role=row["role"],
                     created_at=row["created_at"],
+                    created_by=row["created_by"],
                     has_local_password=bool(row["has_local_password"]),
-                    accessible_workspaces=access_map.get(row["id"], []),
+                    accessible_workspaces=[]
+                    if row["role"] in {"superadmin", "admin"}
+                    else access_map.get(row["id"], []),
                 )
                 for row in rows
             ]
@@ -489,7 +520,7 @@ class AuthService:
         user_id: int,
         workspace_names: list[str],
     ) -> list[str]:
-        if current_user.role != "superadmin":
+        if current_user.role not in {"superadmin", "admin"}:
             raise AuthForbiddenError()
 
         normalized = sorted(set(workspace_names))
@@ -509,6 +540,13 @@ class AuthService:
                 )
             if user_row["role"] == "superadmin":
                 return []
+            if current_user.role == "admin" and user_row["role"] != "user":
+                raise AppError(
+                    code="WORKSPACE_ASSIGNMENT_TARGET_FORBIDDEN",
+                    message="Admin can only update normal user workspace access",
+                    details={"user_id": user_id, "role": user_row["role"]},
+                    status_code=403,
+                )
 
             conn.execute(
                 "DELETE FROM user_workspace_access WHERE user_id = ?",
@@ -527,8 +565,84 @@ class AuthService:
             conn.commit()
         return normalized
 
+    def set_user_role(
+        self,
+        *,
+        current_user: AuthUser,
+        user_id: int,
+        role: str,
+    ) -> AuthUser:
+        if current_user.role != "superadmin":
+            raise AuthForbiddenError()
+        normalized_role = self._normalize_assignable_role(role)
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, username, role, created_at,
+                       created_by, has_local_password, display_name, avatar_url,
+                       feishu_union_id, feishu_open_id
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise AppError(
+                    code="USER_NOT_FOUND",
+                    message="User not found",
+                    details={"user_id": user_id},
+                    status_code=404,
+                )
+            if row["role"] == "superadmin":
+                raise AppError(
+                    code="SUPERADMIN_ROLE_CHANGE_FORBIDDEN",
+                    message="Superadmin role change is not allowed",
+                    details={"user_id": user_id},
+                    status_code=403,
+                )
+            conn.execute(
+                "UPDATE users SET role = ? WHERE id = ?",
+                (normalized_role, user_id),
+            )
+            conn.commit()
+            return AuthUser(
+                id=row["id"],
+                username=row["username"],
+                role=normalized_role,
+                created_at=row["created_at"],
+                created_by=row["created_by"],
+                has_local_password=bool(row["has_local_password"]),
+                display_name=row["display_name"],
+                avatar_url=row["avatar_url"],
+                feishu_union_id=row["feishu_union_id"],
+                feishu_open_id=row["feishu_open_id"],
+                accessible_workspaces=[],
+            )
+
+    def grant_workspace_access_to_user(
+        self,
+        *,
+        user_id: int,
+        workspace: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO user_workspace_access
+                (user_id, workspace, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, workspace) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, workspace, now, now),
+            )
+            conn.commit()
+
     def get_accessible_workspaces(self, user: AuthUser) -> list[str]:
-        if user.role == "superadmin":
+        if user.role in {"superadmin", "admin"}:
             return []
         with closing(sqlite3.connect(self._db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -553,10 +667,90 @@ class AuthService:
             )
 
     def can_access_workspace(self, user: AuthUser, workspace: str) -> bool:
-        if user.role == "superadmin":
+        if user.role in {"superadmin", "admin"}:
             return True
         with closing(sqlite3.connect(self._db_path)) as conn:
             return self._is_workspace_accessible_for_user(conn, user.id, workspace)
+
+    def delete_user(
+        self,
+        *,
+        current_user: AuthUser,
+        user_id: int,
+    ) -> None:
+        if current_user.role not in {"superadmin", "admin"}:
+            raise AuthForbiddenError()
+
+        with closing(sqlite3.connect(self._db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            target = conn.execute(
+                """
+                SELECT id, role, created_by
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if target is None:
+                raise AppError(
+                    code="USER_NOT_FOUND",
+                    message="User not found",
+                    details={"user_id": user_id},
+                    status_code=404,
+                )
+
+            if current_user.role == "admin":
+                if target["role"] != "user" or target["created_by"] != current_user.id:
+                    raise AppError(
+                        code="USER_DELETE_FORBIDDEN",
+                        message="Admin can only delete normal users created by self",
+                        details={"user_id": user_id},
+                        status_code=403,
+                    )
+            elif target["role"] == "superadmin":
+                count_row = conn.execute(
+                    "SELECT COUNT(1) AS c FROM users WHERE role = 'superadmin'"
+                ).fetchone()
+                count = int(count_row["c"] if count_row is not None else 0)
+                if count <= 1:
+                    raise AppError(
+                        code="LAST_SUPERADMIN_DELETE_FORBIDDEN",
+                        message="Cannot delete the last superadmin",
+                        details={"user_id": user_id},
+                        status_code=403,
+                    )
+
+            personal_workspace_row = None
+            if self._table_exists(conn, "workspace_registry"):
+                personal_workspace_row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM workspace_registry
+                    WHERE mode = 'personal' AND owner_user_id = ?
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                ).fetchone()
+            if personal_workspace_row is not None:
+                raise AppError(
+                    code="USER_DELETE_PERSONAL_WORKSPACE_EXISTS",
+                    message="User still owns personal workspaces",
+                    details={"user_id": user_id},
+                    status_code=409,
+                )
+
+            conn.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM user_workspace_access WHERE user_id = ?", (user_id,))
+            if self._table_exists(conn, "mcp_tokens"):
+                conn.execute("DELETE FROM mcp_tokens WHERE user_id = ?", (user_id,))
+            if self._table_exists(conn, "user_workspace_preferences"):
+                conn.execute(
+                    "DELETE FROM user_workspace_preferences WHERE user_id = ?",
+                    (user_id,),
+                )
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
 
     def remove_workspace_access_for_all_users(self, workspace: str) -> None:
         with closing(sqlite3.connect(self._db_path)) as conn:
@@ -694,6 +888,17 @@ class AuthService:
                 message="用户名格式不合法（3-32位，字母数字_.-）"
             )
 
+    def _normalize_assignable_role(self, role: str) -> str:
+        normalized = role.strip().lower()
+        if normalized not in _ALLOWED_ASSIGNABLE_ROLES:
+            raise AppError(
+                code="USER_ROLE_INVALID",
+                message="role must be user or admin",
+                details={"role": role},
+                status_code=400,
+            )
+        return normalized
+
     def _validate_password(self, password: str) -> None:
         if len(password) < 6:
             raise AuthInvalidCredentialsError(message="密码长度至少 6 位")
@@ -735,6 +940,7 @@ class AuthService:
         rows = conn.execute("PRAGMA table_info(users)").fetchall()
         existing = {str(row[1]) for row in rows}
         required_sql: dict[str, str] = {
+            "created_by": "ALTER TABLE users ADD COLUMN created_by INTEGER",
             "display_name": "ALTER TABLE users ADD COLUMN display_name TEXT",
             "avatar_url": "ALTER TABLE users ADD COLUMN avatar_url TEXT",
             "feishu_union_id": "ALTER TABLE users ADD COLUMN feishu_union_id TEXT",
@@ -782,6 +988,18 @@ class AuthService:
                 return candidate
             suffix += 1
             candidate = f"{base}_{suffix}"
+
+    def _table_exists(self, conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            LIMIT 1
+            """,
+            (table_name,),
+        ).fetchone()
+        return row is not None
 
     def _replace_user_password(
         self,

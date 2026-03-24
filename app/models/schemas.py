@@ -10,11 +10,15 @@ class WorkspaceItem(BaseModel):
     mode: str = "team"
     owner_user_id: int | None = None
     note: str | None = None
+    tags: list[str] = Field(default_factory=list)
     git_url: str | None = None
     git_username: str | None = None
     has_git_pat: bool = False
     last_pull_at: str | None = None
     last_pull_status: str | None = None
+    last_pull_message: str | None = None
+    last_pull_trigger_mode: str | None = None
+    last_pull_error_detail: str | None = None
 
 
 class WorkspaceListResponse(BaseModel):
@@ -24,6 +28,7 @@ class WorkspaceListResponse(BaseModel):
 class CreateWorkspaceRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     mode: str = Field(default="team", max_length=32)
+    tags: list[str] = Field(default_factory=list, max_length=20)
     git_url: str | None = None
     git_username: str | None = None
     git_pat: str | None = None
@@ -51,6 +56,16 @@ class WorkspaceNoteItem(BaseModel):
     updated_at: str | None = None
 
 
+class UpdateWorkspaceTagsRequest(BaseModel):
+    tags: list[str] = Field(default_factory=list, max_length=20)
+
+
+class WorkspaceTagsItem(BaseModel):
+    workspace: str
+    tags: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
 class WorkspacePullResponse(BaseModel):
     workspace: str
     before_commit: str | None
@@ -58,6 +73,31 @@ class WorkspacePullResponse(BaseModel):
     changed: bool
     summary: str
     pulled_at: str
+    trigger_mode: str | None = None
+    error_detail: str | None = None
+
+
+class WorkspaceAutoPullSettingsItem(BaseModel):
+    enabled: bool
+    interval_minutes: int
+    last_run_at: str | None = None
+    next_run_at: str | None = None
+    updated_by: int | None = None
+    updated_at: str | None = None
+
+
+class UpdateWorkspaceAutoPullSettingsRequest(BaseModel):
+    enabled: bool
+    interval_minutes: int = Field(default=60, ge=15, le=360)
+
+
+class UserWorkspacePreferenceItem(BaseModel):
+    selected_tags: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
+class UpdateUserWorkspacePreferenceRequest(BaseModel):
+    selected_tags: list[str] = Field(default_factory=list, max_length=20)
 
 
 class WorkspaceDeleteResponse(BaseModel):
@@ -199,6 +239,7 @@ class UserResponse(BaseModel):
     display_name: str | None = None
     role: str
     created_at: str
+    created_by: int | None = None
     has_local_password: bool = True
     accessible_workspaces: list[str] = Field(default_factory=list)
 
@@ -213,8 +254,13 @@ class FeishuStatusResponse(BaseModel):
     app_id: str | None = None
 
 
+class FeishuAuthorizeUrlResponse(BaseModel):
+    authorize_url: str
+
+
 class FeishuLoginRequest(BaseModel):
     code: str = Field(min_length=1, max_length=2048)
+    redirect_uri: str | None = Field(default=None, max_length=2048)
 
 
 class SetLocalPasswordRequest(BaseModel):
@@ -352,6 +398,7 @@ class RetryJobFailurePathsRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=6, max_length=128)
+    role: str = Field(default="user", min_length=4, max_length=16)
     workspace_names: list[str] = Field(default_factory=list)
 
 
@@ -359,8 +406,17 @@ class UserListResponse(BaseModel):
     items: list[UserResponse]
 
 
+class DeleteUserResponse(BaseModel):
+    user_id: int
+    deleted_at: str
+
+
 class UpdateUserWorkspaceAccessRequest(BaseModel):
     workspace_names: list[str] = Field(default_factory=list)
+
+
+class UpdateUserRoleRequest(BaseModel):
+    role: str = Field(min_length=4, max_length=16)
 
 
 class LlmConfigBase(BaseModel):

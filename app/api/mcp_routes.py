@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import re
 import time
@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import get_current_user
 from app.api.deps_mcp import get_current_mcp_user
 from app.core.errors import AppError, AuthForbiddenError
+from app.core.errors import WorkspaceCreateError
 from app.models.schemas import (
     CreateMcpIndexJobRequest,
     McpAuthInfoResponse,
@@ -343,25 +344,17 @@ def execute_mcp_tool(
                 return {
                     "mode": "workspace_bound",
                     "message": "当前 MCP 为 workspace 绑定模式，仅返回当前 workspace",
-                    "items": [
-                        {
-                            "name": workspace,
-                            "note": item.note if item else None,
-                        }
-                    ],
+                    "items": [_workspace_summary_for_mcp(item, fallback_name=workspace)],
                 }
 
-            if current_user.role == "superadmin":
+            if current_user.role in {"superadmin", "admin"}:
                 detail_items = workspace_service.list_workspaces()
             else:
                 accessible = auth_service.get_accessible_workspaces(current_user)
                 detail_items = workspace_service.list_workspaces(set(accessible))
             return {
                 "mode": "general",
-                "items": [
-                    {"name": item.name, "note": item.note}
-                    for item in detail_items
-                ],
+                "items": [_workspace_summary_for_mcp(item) for item in detail_items],
             }
 
         if tool == "list_files":
@@ -449,6 +442,133 @@ def execute_mcp_tool(
                 ),
             }
 
+        if tool == "search_git_commits":
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
+            _ensure_git_workspace(workspace)
+            workspace_for_audit = workspace
+            start_time = _normalize_optional(arguments.get("start_time"))
+            end_time = _normalize_optional(arguments.get("end_time"))
+            if not start_time or not end_time:
+                raise AppError(
+                    code="MCP_TOOL_INVALID_ARGUMENT",
+                    message="start_time and end_time are required",
+                    status_code=400,
+                )
+            page = _required_int_value(
+                arguments.get("page"),
+                name="page",
+                min_value=1,
+                max_value=10_000,
+            )
+            page_size = _required_int_value(
+                arguments.get("page_size"),
+                name="page_size",
+                min_value=1,
+                max_value=100,
+            )
+            _validate_git_commit_time_range(start_time, end_time)
+            author = _normalize_optional(arguments.get("author"))
+            path_or_query = author or f"{start_time}~{end_time}"
+            result = workspace_service.search_git_commits(
+                workspace,
+                start_time=start_time,
+                end_time=end_time,
+                page=page,
+                page_size=page_size,
+                author=author,
+            )
+            return {
+                "workspace": result.workspace,
+                "page": result.page,
+                "page_size": result.page_size,
+                "has_more": result.has_more,
+                "items": [
+                    {
+                        "commit_id": item.commit_id,
+                        "subject": item.subject,
+                        "author": item.author,
+                        "authored_at": item.authored_at,
+                        "repo_path": item.repo.repo_path,
+                        "repo_name": item.repo.repo_name,
+                        "current_branch": item.repo.current_branch,
+                        "head_commit": item.repo.head_commit,
+                        "detached": item.repo.detached,
+                    }
+                    for item in result.items
+                ],
+            }
+
+        if tool == "get_git_commit_detail":
+            workspace = _required_workspace(
+                current_user,
+                arguments,
+                bound_workspace=bound_workspace,
+            )
+            _ensure_git_workspace(workspace)
+            workspace_for_audit = workspace
+            commit_id = _normalize_optional(arguments.get("commit_id"))
+            if not commit_id:
+                raise AppError(
+                    code="MCP_TOOL_INVALID_ARGUMENT",
+                    message="commit_id is required",
+                    status_code=400,
+                )
+            repo_path = _normalize_optional(arguments.get("repo_path"))
+            path_or_query = commit_id
+            try:
+                detail = workspace_service.get_git_commit_detail(
+                    workspace,
+                    commit_id=commit_id,
+                    repo_path=repo_path,
+                )
+            except WorkspaceCreateError as exc:
+                reason = (
+                    str(exc.details.get("reason"))
+                    if isinstance(exc.details, dict)
+                    and exc.details.get("reason") is not None
+                    else str(exc)
+                )
+                if "commit matches multiple git modules:" in reason:
+                    matches = [
+                        item.strip()
+                        for item in reason.split(":", maxsplit=1)[1].split(",")
+                        if item.strip()
+                    ]
+                    raise AppError(
+                        code="MCP_GIT_COMMIT_AMBIGUOUS",
+                        message=(
+                            "commit_id matched multiple git modules, "
+                            "please specify repo_path"
+                        ),
+                        details={
+                            "workspace": workspace,
+                            "commit_id": commit_id,
+                            "matches": matches,
+                        },
+                        status_code=400,
+                    ) from exc
+                raise
+            return {
+                "workspace": detail.workspace,
+                "commit_id": detail.commit_id,
+                "subject": detail.subject,
+                "author": detail.author,
+                "authored_at": detail.authored_at,
+                "body": detail.body,
+                "repo_path": detail.repo.repo_path,
+                "repo_name": detail.repo.repo_name,
+                "current_branch": detail.repo.current_branch,
+                "head_commit": detail.repo.head_commit,
+                "detached": detail.repo.detached,
+                "changed_files": detail.changed_files,
+                "patch": detail.patch,
+                "truncated": detail.truncated,
+            }
+
         raise AppError(
             code="MCP_TOOL_NOT_SUPPORTED",
             message="tool is not supported",
@@ -508,8 +628,33 @@ def _assert_workspace_access(current_user: AuthUser, workspace: str) -> None:
     workspace_service.get_workspace_path(workspace)
 
 
+def _ensure_git_workspace(workspace: str) -> None:
+    root = workspace_service.get_workspace_path(workspace)
+    if not (root / ".git").exists():
+        raise AppError(
+            code="MCP_GIT_UNAVAILABLE",
+            message="this workspace is not a git repository",
+            details={"workspace": workspace},
+            status_code=400,
+        )
+
+
+def _workspace_summary_for_mcp(
+    item: Any | None,
+    *,
+    fallback_name: str | None = None,
+) -> dict[str, Any]:
+    summary = {
+        "name": item.name if item is not None else fallback_name,
+        "note": item.note if item is not None else None,
+    }
+    if item is not None and item.git_url:
+        summary["last_pull_at"] = item.last_pull_at
+    return summary
+
+
 def _user_workspaces(current_user: AuthUser) -> list[str]:
-    if current_user.role == "superadmin":
+    if current_user.role in {"superadmin", "admin"}:
         return [item.name for item in workspace_service.list_workspaces()]
     return auth_service.get_accessible_workspaces(current_user)
 
@@ -731,6 +876,36 @@ def _int_value(value: Any, *, default: int, min_value: int, max_value: int) -> i
     return max(min_value, min(parsed, max_value))
 
 
+def _required_int_value(
+    value: Any,
+    *,
+    name: str,
+    min_value: int,
+    max_value: int,
+) -> int:
+    if value is None:
+        raise AppError(
+            code="MCP_TOOL_INVALID_ARGUMENT",
+            message=f"{name} is required",
+            status_code=400,
+        )
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise AppError(
+            code="MCP_TOOL_INVALID_ARGUMENT",
+            message=f"{name} must be an integer",
+            status_code=400,
+        ) from exc
+    if parsed < min_value or parsed > max_value:
+        raise AppError(
+            code="MCP_TOOL_INVALID_ARGUMENT",
+            message=f"{name} must be between {min_value} and {max_value}",
+            status_code=400,
+        )
+    return parsed
+
+
 def _bool_value(value: Any, *, default: bool) -> bool:
     if value is None:
         return default
@@ -738,6 +913,62 @@ def _bool_value(value: Any, *, default: bool) -> bool:
         return value
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "on"}
+
+
+def _validate_git_commit_time_range(start_time: str, end_time: str) -> None:
+    start_dt = _parse_git_time_argument(start_time, name="start_time")
+    end_dt = _parse_git_time_argument(end_time, name="end_time")
+    if end_dt < start_dt:
+        raise AppError(
+            code="MCP_TOOL_INVALID_ARGUMENT",
+            message="end_time must be greater than or equal to start_time",
+            status_code=400,
+        )
+    if end_dt > _add_months(start_dt, 3):
+        raise AppError(
+            code="MCP_GIT_TIME_RANGE_TOO_LARGE",
+            message=(
+                "time range cannot exceed 3 months, "
+                "please narrow start_time and end_time"
+            ),
+            details={"start_time": start_time, "end_time": end_time},
+            status_code=400,
+        )
+
+
+def _parse_git_time_argument(value: str, *, name: str) -> datetime:
+    stripped = value.strip()
+    try:
+        if "T" in stripped:
+            dt = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+        else:
+            dt = datetime.combine(date.fromisoformat(stripped), datetime.min.time())
+    except ValueError as exc:
+        raise AppError(
+            code="MCP_TOOL_INVALID_ARGUMENT",
+            message=f"{name} must be an ISO date or datetime",
+            status_code=400,
+        ) from exc
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _add_months(value: datetime, months: int) -> datetime:
+    total_month = value.month - 1 + months
+    year = value.year + total_month // 12
+    month = total_month % 12 + 1
+    day = min(value.day, _days_in_month(year, month))
+    return value.replace(year=year, month=month, day=day)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    current_month = date(year, month, 1)
+    return (next_month - current_month).days
 
 
 def _request_base_url(request: Request) -> str:

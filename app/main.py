@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Callable
 import logging
+from pathlib import Path
 import threading
 import time
 
@@ -25,7 +26,11 @@ from app.services.mcp_vector_service import mcp_vector_service
 from app.services.workspace_credential_service import workspace_credential_service
 from app.services.workspace_git_service import workspace_git_service
 from app.services.workspace_agent_profile_service import workspace_agent_profile_service
+from app.services.workspace_auto_pull_service import workspace_auto_pull_service
 from app.services.workspace_service import workspace_service
+from app.services.user_workspace_preference_service import (
+    user_workspace_preference_service,
+)
 
 _fastmcp_app = build_fastmcp_asgi_app()
 
@@ -157,7 +162,9 @@ def _startup() -> None:
     llm_config_service.init_db()
     workspace_credential_service.init_db()
     workspace_git_service.init_db()
+    workspace_auto_pull_service.init_db()
     workspace_agent_profile_service.init_db()
+    user_workspace_preference_service.init_db()
     mcp_token_service.init_db()
     mcp_settings_service.init_db()
     mcp_index_job_service.init_db()
@@ -165,6 +172,7 @@ def _startup() -> None:
     mcp_vector_service.init_db()
     mcp_audit_service.cleanup_old_logs(keep_days=30)
     _start_mcp_audit_cleanup_daemon()
+    _start_workspace_auto_pull_daemon()
 
 
 def _start_mcp_audit_cleanup_daemon() -> None:
@@ -184,6 +192,43 @@ def _start_mcp_audit_cleanup_daemon() -> None:
 
     thread = threading.Thread(target=_loop, daemon=True)
     thread.start()
+
+
+def _start_workspace_auto_pull_daemon() -> None:
+    def _loop() -> None:
+        while True:
+            try:
+                if workspace_auto_pull_service.should_run_now():
+                    _run_workspace_auto_pull_once()
+            except Exception:
+                logger.exception("workspace auto pull daemon loop failed")
+            time.sleep(60)
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+
+
+def _run_workspace_auto_pull_once() -> None:
+    settings_value = workspace_auto_pull_service.get_settings()
+    if not settings_value.enabled:
+        return
+    items = workspace_service.list_workspaces()
+    for item in items:
+        if not item.git_url:
+            continue
+        workspace_root = Path(item.path)
+        if not workspace_root.exists() or not (workspace_root / ".git").exists():
+            logger.info(
+                "workspace auto pull skipped workspace=%s reason=%s",
+                item.workspace_id,
+                "not_a_git_repo",
+            )
+            continue
+        try:
+            workspace_service.pull_workspace(item.workspace_id, trigger_mode="auto")
+        except Exception:
+            logger.exception("workspace auto pull failed workspace=%s", item.workspace_id)
+    workspace_auto_pull_service.mark_run_finished()
 
 
 @app.get("/")

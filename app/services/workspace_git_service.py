@@ -15,6 +15,8 @@ class WorkspaceGitSyncMeta:
     last_pull_at: str | None
     last_pull_status: str | None
     last_pull_message: str | None
+    last_pull_trigger_mode: str | None
+    last_pull_error_detail: str | None
 
 
 class WorkspaceGitService:
@@ -31,17 +33,42 @@ class WorkspaceGitService:
                     last_pull_at TEXT,
                     last_pull_status TEXT,
                     last_pull_message TEXT,
+                    last_pull_trigger_mode TEXT,
+                    last_pull_error_detail TEXT,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_columns(conn)
             conn.commit()
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(workspace_git_sync)").fetchall()
+        }
+        if "last_pull_trigger_mode" not in existing:
+            conn.execute(
+                """
+                ALTER TABLE workspace_git_sync
+                ADD COLUMN last_pull_trigger_mode TEXT
+                """
+            )
+        if "last_pull_error_detail" not in existing:
+            conn.execute(
+                """
+                ALTER TABLE workspace_git_sync
+                ADD COLUMN last_pull_error_detail TEXT
+                """
+            )
 
     def set_pull_result(
         self,
         workspace: str,
         status: str,
         message: str | None,
+        trigger_mode: str | None = None,
+        error_detail: str | None = None,
         pulled_at: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -50,16 +77,27 @@ class WorkspaceGitService:
             conn.execute(
                 """
                 INSERT INTO workspace_git_sync (
-                    workspace, last_pull_at, last_pull_status, last_pull_message, updated_at
+                    workspace, last_pull_at, last_pull_status, last_pull_message,
+                    last_pull_trigger_mode, last_pull_error_detail, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workspace) DO UPDATE SET
                     last_pull_at=excluded.last_pull_at,
                     last_pull_status=excluded.last_pull_status,
                     last_pull_message=excluded.last_pull_message,
+                    last_pull_trigger_mode=excluded.last_pull_trigger_mode,
+                    last_pull_error_detail=excluded.last_pull_error_detail,
                     updated_at=excluded.updated_at
                 """,
-                (workspace, last_pull_at, status, message, now),
+                (
+                    workspace,
+                    last_pull_at,
+                    status,
+                    message,
+                    trigger_mode,
+                    error_detail,
+                    now,
+                ),
             )
             conn.commit()
 
@@ -69,7 +107,8 @@ class WorkspaceGitService:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT workspace, last_pull_at, last_pull_status, last_pull_message
+                SELECT workspace, last_pull_at, last_pull_status, last_pull_message,
+                       last_pull_trigger_mode, last_pull_error_detail
                 FROM workspace_git_sync
                 """
             ).fetchall()
@@ -79,6 +118,8 @@ class WorkspaceGitService:
                     last_pull_at=row["last_pull_at"],
                     last_pull_status=row["last_pull_status"],
                     last_pull_message=row["last_pull_message"],
+                    last_pull_trigger_mode=row["last_pull_trigger_mode"],
+                    last_pull_error_detail=row["last_pull_error_detail"],
                 )
                 result[item.workspace] = item
         return result
