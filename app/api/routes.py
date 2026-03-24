@@ -1718,7 +1718,9 @@ def _resolve_workspace_with_access(workspace: str, current_user: AuthUser):
     if not auth_service.can_access_workspace(current_user, workspace):
         raise AuthForbiddenError()
     allowed_ids = None
-    if current_user.role != "superadmin":
+    # superadmin / admin 都拥有全工作空间访问权，此处不应再传入空的
+    # allowed_workspace_ids 集合，否则会把“可访问”错误收窄成“未找到”。
+    if current_user.role not in {"superadmin", "admin"}:
         allowed_ids = set(auth_service.get_accessible_workspaces(current_user))
     try:
         meta = workspace_service.resolve_workspace_reference(
