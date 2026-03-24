@@ -88,6 +88,14 @@ class WorkspaceBranchService:
         repo_dir = self._resolve_repo_dir(workspace_path=workspace_path, repo_key=repo_key)
         username, pat = self._workspace_git_credential(workspace)
 
+        # 历史仓库可能只配置了 master 单分支 fetch，导致看不到其他远端分支。
+        # 在列分支前先自愈为“跟踪全部 origin 分支”，避免用户手工修 .git/config。
+        self._ensure_origin_fetch_tracks_all_branches(
+            repo_dir=repo_dir,
+            git_username=username,
+            git_pat=pat,
+        )
+
         # 先 fetch，保证用户可看到最新远端分支。
         self._run_git(
             repo_dir,
@@ -185,6 +193,12 @@ class WorkspaceBranchService:
                 status_code=400,
             )
 
+        # 切换前也执行一次 fetch refspec 自愈，确保远端分支可被正常发现。
+        self._ensure_origin_fetch_tracks_all_branches(
+            repo_dir=repo_dir,
+            git_username=username,
+            git_pat=pat,
+        )
         self._run_git(
             repo_dir,
             ['fetch', '--all', '--prune'],
@@ -372,6 +386,60 @@ class WorkspaceBranchService:
             self._run_git(
                 repo_dir,
                 ['show-ref', '--verify', '--quiet', ref],
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            return True
+        except WorkspaceCreateError:
+            return False
+
+    def _ensure_origin_fetch_tracks_all_branches(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> None:
+        if not self._has_remote_origin(
+            repo_dir=repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        ):
+            return
+
+        fetch_specs = self._run_git(
+            repo_dir,
+            ['config', '--get-all', 'remote.origin.fetch'],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+        normalized_specs = {
+            line.strip()
+            for line in fetch_specs.splitlines()
+            if line.strip()
+        }
+        full_refspec = '+refs/heads/*:refs/remotes/origin/*'
+        if full_refspec in normalized_specs:
+            return
+
+        self._run_git(
+            repo_dir,
+            ['config', '--replace-all', 'remote.origin.fetch', full_refspec],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+    def _has_remote_origin(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> bool:
+        try:
+            self._run_git(
+                repo_dir,
+                ['remote', 'get-url', 'origin'],
                 git_username=git_username,
                 git_pat=git_pat,
             )
