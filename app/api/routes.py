@@ -640,6 +640,14 @@ def create_workspace(
         creator_user_id=current_user.id,
         owner_user_id=owner_user_id,
     )
+    normalized_note = body.note.strip() if body.note is not None else None
+    if normalized_note is not None:
+        note_item = workspace_note_service.upsert_note(
+            workspace=item.workspace_id,
+            note=normalized_note or None,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        item.note = note_item.note
     if body.tags:
         tags_item = workspace_tag_service.replace_tags(
             workspace=item.workspace_id,
@@ -720,7 +728,7 @@ def update_workspace_note(
     current_user: AuthUser = Depends(get_current_user),
 ) -> WorkspaceNoteItem:
     meta = workspace_service.get_workspace_meta(workspace)
-    if meta.mode == "team" and current_user.role != "superadmin":
+    if meta.mode == "team" and current_user.role not in {"superadmin", "admin"}:
         raise AuthForbiddenError()
     if meta.mode == "personal":
         if current_user.role != "superadmin" and meta.owner_user_id != current_user.id:

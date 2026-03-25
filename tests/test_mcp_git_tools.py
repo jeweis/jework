@@ -12,6 +12,7 @@ from app.services.auth_service import AuthUser
 from app.services.workspace_credential_service import WorkspaceCredentialService
 from app.services.workspace_git_service import WorkspaceGitService
 from app.services.workspace_service import WorkspaceService
+from app.services.workspace_tag_service import WorkspaceTagService
 
 
 def _run_git(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -283,6 +284,44 @@ def test_list_workspaces_includes_last_pull_at_for_git_workspace(
     )
     assert git_summary["last_pull_at"] == "2026-03-24T09:30:00+08:00"
     assert "last_pull_at" not in plain_summary
+
+
+def test_list_workspaces_includes_tags_for_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "app.db"
+    tag_service = WorkspaceTagService(str(db_path))
+    service = WorkspaceService(
+        tmp_path,
+        tag_service=tag_service,
+    )
+    service.init_db()
+
+    item = service.create_workspace("tagged-workspace")
+    tag_service.replace_tags(
+        workspace=item.workspace_id,
+        tags=["后端", "高优先级"],
+        updated_at="2026-03-25T10:00:00+08:00",
+    )
+    monkeypatch.setattr(mcp_routes, "workspace_service", service)
+
+    current_user = AuthUser(
+        id=1,
+        username="root",
+        role="superadmin",
+        created_at="2026-03-24T00:00:00+00:00",
+    )
+
+    result = execute_mcp_tool(
+        current_user=current_user,
+        tool="list_workspaces",
+        arguments={},
+    )
+
+    items = result["items"]
+    tagged = next(item for item in items if item["name"] == "tagged-workspace")
+    assert tagged["tags"] == ["后端", "高优先级"]
 
 
 def test_search_git_commits_includes_submodule_results(tmp_path: Path) -> None:

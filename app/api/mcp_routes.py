@@ -647,6 +647,7 @@ def _workspace_summary_for_mcp(
     summary = {
         "name": item.name if item is not None else fallback_name,
         "note": item.note if item is not None else None,
+        "tags": item.tags if item is not None else [],
     }
     if item is not None and item.git_url:
         summary["last_pull_at"] = item.last_pull_at

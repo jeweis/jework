@@ -28,6 +28,7 @@ class WorkspaceListResponse(BaseModel):
 class CreateWorkspaceRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     mode: str = Field(default="team", max_length=32)
+    note: str | None = Field(default=None, max_length=500)
     tags: list[str] = Field(default_factory=list, max_length=20)
     git_url: str | None = None
     git_username: str | None = None

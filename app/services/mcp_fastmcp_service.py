@@ -170,7 +170,7 @@ def build_fastmcp_asgi_app():
     @mcp.tool(
         name="list_workspaces",
         description=(
-            "列出当前可访问的工作空间（name + note）。"
+            "列出当前可访问的工作空间（name + note + tags）。"
             "若某个工作空间接入了 Git，还会返回最近一次拉取时间 last_pull_at。"
             "在多工作空间模式下返回全部可访问 workspace；"
             "在绑定工作空间模式下仅返回当前绑定 workspace，并附带绑定模式提示。"
