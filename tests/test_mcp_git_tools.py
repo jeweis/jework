@@ -8,6 +8,7 @@ import pytest
 from app.api import mcp_routes
 from app.api.mcp_routes import execute_mcp_tool
 from app.core.errors import AppError
+from app.core.errors import WorkspaceCreateError
 from app.services.auth_service import AuthUser
 from app.services.workspace_credential_service import WorkspaceCredentialService
 from app.services.workspace_git_service import WorkspaceGitService
@@ -86,6 +87,11 @@ def _create_submodule_repo(parent_dir: Path) -> tuple[Path, str]:
         authored_at="2026-02-20T12:00:00+00:00",
     )
     return submodule_source, commit_id
+
+
+def _create_bare_remote_from_repo(source_repo: Path, remote_dir: Path) -> Path:
+    _run_git(source_repo, "clone", "--bare", str(source_repo), str(remote_dir))
+    return remote_dir
 
 
 def _commit_all(
@@ -382,3 +388,182 @@ def test_search_git_commits_includes_submodule_results(tmp_path: Path) -> None:
     assert detail.repo.repo_path == "third_party/demo-lib"
     assert detail.commit_id == submodule_commit
     assert "module.py" in detail.changed_files
+
+
+def test_search_git_commits_keeps_root_results_when_submodule_query_fails(
+    tmp_path: Path,
+) -> None:
+    service = WorkspaceService(tmp_path)
+    service.init_db()
+    item = service.create_workspace("git-submodule-warning-demo")
+    repo_dir = Path(item.path)
+
+    _run_git(repo_dir, "init")
+    _run_git(repo_dir, "config", "user.name", "Default User")
+    _run_git(repo_dir, "config", "user.email", "default@example.com")
+    root_commit = _commit_file(
+        repo_dir,
+        file_name="README.md",
+        content="# demo\n",
+        message="root init",
+        author_name="Alice",
+        author_email="alice@example.com",
+        authored_at="2026-02-10T08:00:00+00:00",
+    )
+
+    submodule_source, _ = _create_submodule_repo(tmp_path)
+    _run_git_allow_file(
+        repo_dir,
+        "submodule",
+        "add",
+        str(submodule_source),
+        "third_party/demo-lib",
+    )
+    _commit_all(
+        repo_dir,
+        message="add submodule",
+        author_name="Bob",
+        author_email="bob@example.com",
+        authored_at="2026-02-21T09:00:00+00:00",
+    )
+
+    original_run_git = service._run_git
+
+    def flaky_run_git(repo_dir_arg, args, git_username=None, git_pat=None):
+        if (
+            Path(repo_dir_arg).resolve() == (repo_dir / "third_party/demo-lib").resolve()
+            and args
+            and args[0] == "log"
+        ):
+            raise WorkspaceCreateError(
+                "git-submodule-warning-demo",
+                "simulated submodule git log failure",
+            )
+        return original_run_git(
+            repo_dir_arg,
+            args,
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+    service._run_git = flaky_run_git  # type: ignore[method-assign]
+
+    result = service.search_git_commits(
+        "git-submodule-warning-demo",
+        start_time="2026-02-01",
+        end_time="2026-03-01",
+        page=1,
+        page_size=20,
+    )
+
+    assert any(
+        item.commit_id == root_commit and item.repo.repo_path == "."
+        for item in result.items
+    )
+    assert any(
+        warning.repo_path == "third_party/demo-lib"
+        and "simulated submodule git log failure" in warning.error
+        for warning in result.warnings
+    )
+
+
+def test_search_git_commits_fetches_more_history_from_shallow_submodule(
+    tmp_path: Path,
+) -> None:
+    service = WorkspaceService(tmp_path)
+    service.init_db()
+    item = service.create_workspace("git-submodule-fetch-demo")
+    repo_dir = Path(item.path)
+
+    _run_git(repo_dir, "init")
+    _run_git(repo_dir, "config", "user.name", "Default User")
+    _run_git(repo_dir, "config", "user.email", "default@example.com")
+    _commit_file(
+        repo_dir,
+        file_name="README.md",
+        content="# demo\n",
+        message="root init",
+        author_name="Alice",
+        author_email="alice@example.com",
+        authored_at="2026-02-10T08:00:00+00:00",
+    )
+
+    source_repo = tmp_path / "demo-lib-source"
+    source_repo.mkdir(parents=True, exist_ok=True)
+    _run_git(source_repo, "init", "-b", "main")
+    _run_git(source_repo, "config", "user.name", "Submodule User")
+    _run_git(source_repo, "config", "user.email", "submodule@example.com")
+    first_commit = _commit_file(
+        source_repo,
+        file_name="module.py",
+        content="print('v1')\n",
+        message="submodule v1",
+        author_name="Carol",
+        author_email="carol@example.com",
+        authored_at="2026-02-20T12:00:00+00:00",
+    )
+    second_commit = _commit_file(
+        source_repo,
+        file_name="module.py",
+        content="print('v2')\n",
+        message="submodule v2",
+        author_name="Carol",
+        author_email="carol@example.com",
+        authored_at="2026-02-22T12:00:00+00:00",
+    )
+    remote_repo = _create_bare_remote_from_repo(
+        source_repo,
+        tmp_path / "demo-lib-remote.git",
+    )
+
+    submodule_dir = repo_dir / "third_party" / "demo-lib"
+    submodule_dir.parent.mkdir(parents=True, exist_ok=True)
+    _run_git_allow_file(
+        repo_dir,
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        "main",
+        f"file://{remote_repo}",
+        str(submodule_dir),
+    )
+    (repo_dir / ".gitmodules").write_text(
+        '[submodule "third_party/demo-lib"]\n'
+        "\tpath = third_party/demo-lib\n"
+        f"\turl = file://{remote_repo}\n",
+        encoding="utf-8",
+    )
+    _run_git(repo_dir, "add", ".gitmodules")
+    _run_git(repo_dir, "commit", "-m", "register submodule")
+
+    shallow_before = _run_git(
+        submodule_dir,
+        "rev-parse",
+        "--is-shallow-repository",
+    )
+    assert shallow_before == "true"
+
+    result = service.search_git_commits(
+        "git-submodule-fetch-demo",
+        start_time="2026-02-01",
+        end_time="2026-03-01",
+        page=1,
+        page_size=20,
+    )
+
+    submodule_hits = [
+        item for item in result.items if item.repo.repo_path == "third_party/demo-lib"
+    ]
+    submodule_commit_ids = {item.commit_id for item in submodule_hits}
+    assert first_commit in submodule_commit_ids
+    assert second_commit in submodule_commit_ids
+    assert all(item.repo.current_branch == "main" for item in submodule_hits)
+    assert result.warnings == []
+
+    shallow_after = _run_git(
+        submodule_dir,
+        "rev-parse",
+        "--is-shallow-repository",
+    )
+    assert shallow_after == "false"

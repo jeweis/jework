@@ -500,6 +500,14 @@ def execute_mcp_tool(
                     }
                     for item in result.items
                 ],
+                "warnings": [
+                    {
+                        "repo_path": warning.repo_path,
+                        "repo_name": warning.repo_name,
+                        "error": warning.error,
+                    }
+                    for warning in result.warnings
+                ],
             }
 
         if tool == "get_git_commit_detail":

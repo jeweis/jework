@@ -9,7 +9,7 @@ import stat
 import subprocess
 import tempfile
 from urllib.parse import urlparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -80,6 +80,14 @@ class WorkspaceGitCommitSearchResult:
     page_size: int
     items: list[WorkspaceGitCommitSummary]
     has_more: bool
+    warnings: list["WorkspaceGitModuleWarning"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class WorkspaceGitModuleWarning:
+    repo_path: str
+    repo_name: str
+    error: str
 
 
 @dataclass(frozen=True)
@@ -1061,15 +1069,23 @@ class WorkspaceService:
     ) -> WorkspaceGitCommitSearchResult:
         meta, target, username, pat = self._prepare_git_workspace(workspace)
         normalized_author = self._normalize_optional(author)
-        modules = self._list_git_modules(
+        modules, warnings = self._list_git_modules_best_effort(
             root_repo_dir=target,
             git_username=username,
             git_pat=pat,
+        )
+        warnings.extend(
+            self._sync_git_modules_best_effort(
+                modules=modules,
+                git_username=username,
+                git_pat=pat,
+            )
         )
         items: list[WorkspaceGitCommitSummary] = []
         for module in modules:
             git_args = [
                 "log",
+                "--all",
                 "--date=iso-strict",
                 f"--since={start_time}",
                 f"--until={end_time}",
@@ -1077,12 +1093,24 @@ class WorkspaceService:
             ]
             if normalized_author:
                 git_args.append(f"--author={normalized_author}")
-            output = self._run_git(
-                module["repo_dir"],
-                git_args,
-                git_username=username,
-                git_pat=pat,
-            )
+            context = module["context"]
+            assert isinstance(context, WorkspaceGitRepoContext)
+            try:
+                output = self._run_git(
+                    module["repo_dir"],
+                    git_args,
+                    git_username=username,
+                    git_pat=pat,
+                )
+            except WorkspaceCreateError as exc:
+                warnings.append(
+                    WorkspaceGitModuleWarning(
+                        repo_path=context.repo_path,
+                        repo_name=context.repo_name,
+                        error=self._workspace_create_reason(exc),
+                    )
+                )
+                continue
             rows = [line for line in output.splitlines() if line.strip()]
             for row in rows:
                 parts = row.split("\x1f")
@@ -1113,6 +1141,7 @@ class WorkspaceService:
             page_size=page_size,
             items=items[skip : skip + page_size],
             has_more=has_more,
+            warnings=warnings,
         )
 
     def get_git_commit_detail(
@@ -1315,6 +1344,75 @@ class WorkspaceService:
         collect(root_repo_dir, ".")
         return modules
 
+    def _list_git_modules_best_effort(
+        self,
+        *,
+        root_repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> tuple[
+        list[dict[str, Path | WorkspaceGitRepoContext]],
+        list[WorkspaceGitModuleWarning],
+    ]:
+        modules: list[dict[str, Path | WorkspaceGitRepoContext]] = []
+        warnings: list[WorkspaceGitModuleWarning] = []
+
+        def collect(repo_dir: Path, repo_path: str) -> None:
+            repo_name = "root" if repo_path == "." else repo_path
+            try:
+                context = self._build_git_repo_context(
+                    repo_dir=repo_dir,
+                    repo_path=repo_path,
+                    git_username=git_username,
+                    git_pat=git_pat,
+                )
+            except WorkspaceCreateError as exc:
+                warnings.append(
+                    WorkspaceGitModuleWarning(
+                        repo_path=repo_path,
+                        repo_name=repo_name,
+                        error=self._workspace_create_reason(exc),
+                    )
+                )
+                return
+
+            modules.append({"repo_dir": repo_dir, "context": context})
+
+            try:
+                submodule_paths = self._list_submodule_paths(repo_dir=repo_dir)
+            except WorkspaceCreateError as exc:
+                warnings.append(
+                    WorkspaceGitModuleWarning(
+                        repo_path=repo_path,
+                        repo_name=repo_name,
+                        error=(
+                            "failed to enumerate submodules: "
+                            f"{self._workspace_create_reason(exc)}"
+                        ),
+                    )
+                )
+                return
+
+            for sub_path in submodule_paths:
+                nested_repo_dir = (repo_dir / sub_path).resolve()
+                nested_repo_path = (
+                    sub_path if repo_path == "." else f"{repo_path}/{sub_path}"
+                )
+                nested_repo_name = nested_repo_path
+                if not (nested_repo_dir / ".git").exists():
+                    warnings.append(
+                        WorkspaceGitModuleWarning(
+                            repo_path=nested_repo_path,
+                            repo_name=nested_repo_name,
+                            error="submodule is not initialized or missing git metadata",
+                        )
+                    )
+                    continue
+                collect(nested_repo_dir, nested_repo_path)
+
+        collect(root_repo_dir, ".")
+        return modules, warnings
+
     def _build_git_repo_context(
         self,
         *,
@@ -1336,13 +1434,116 @@ class WorkspaceService:
             git_pat=git_pat,
         )
         detached = branch_name == "HEAD"
+        resolved_branch = (
+            self._infer_git_branch_name(
+                repo_dir=repo_dir,
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            if detached
+            else branch_name
+        )
         return WorkspaceGitRepoContext(
             repo_path=repo_path,
             repo_name="root" if repo_path == "." else repo_path,
-            current_branch=None if detached else branch_name,
+            current_branch=resolved_branch,
             head_commit=head_commit,
             detached=detached,
         )
+
+    def _infer_git_branch_name(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> str | None:
+        """
+        在 detached HEAD 场景下尽量推断一个最合适的分支名。
+
+        设计取舍：
+        - `detached=true` 仍保留，明确告诉调用方当前不是直接检出在分支头上。
+        - `current_branch` 仅作为“最接近的参考分支”返回，方便 Agent 理解当前仓库大致归属。
+        - 优先级：
+          1. 本地分支包含 HEAD
+          2. origin 远端跟踪分支包含 HEAD
+          3. origin/HEAD 指向的默认分支
+        """
+        try:
+            output = self._run_git(
+                repo_dir,
+                [
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "--contains",
+                    "HEAD",
+                    "refs/heads",
+                    "refs/remotes/origin",
+                ],
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+        except WorkspaceCreateError:
+            output = ""
+
+        local_branches: list[str] = []
+        remote_branches: list[str] = []
+        normalized_candidates: list[str] = []
+        seen: set[str] = set()
+
+        for raw_line in output.splitlines():
+            name = raw_line.strip()
+            if not name or name == "origin/HEAD":
+                continue
+            if name.startswith("origin/"):
+                remote_branches.append(name[7:])
+            else:
+                local_branches.append(name)
+
+        for candidate in [*local_branches, *remote_branches]:
+            if candidate not in seen:
+                normalized_candidates.append(candidate)
+                seen.add(candidate)
+
+        if len(normalized_candidates) == 1:
+            return normalized_candidates[0]
+
+        if normalized_candidates:
+            default_branch = self._read_origin_head_branch(
+                repo_dir=repo_dir,
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            if default_branch and default_branch in normalized_candidates:
+                return default_branch
+            return normalized_candidates[0]
+
+        return self._read_origin_head_branch(
+            repo_dir=repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+    def _read_origin_head_branch(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> str | None:
+        try:
+            output = self._run_git(
+                repo_dir,
+                ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+        except WorkspaceCreateError:
+            return None
+        normalized = output.strip()
+        if normalized.startswith("origin/"):
+            return normalized[7:]
+        return normalized or None
 
     def _find_git_commit_matches(
         self,
@@ -1378,11 +1579,165 @@ class WorkspaceService:
             matches.append(module)
         return matches
 
+    def _sync_git_modules_best_effort(
+        self,
+        *,
+        modules: list[dict[str, Path | WorkspaceGitRepoContext]],
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> list[WorkspaceGitModuleWarning]:
+        """
+        在查询 Git 历史前尽力同步各模块。
+
+        设计目标：
+        - 主仓和子模块都尽量补齐 refs 与历史，减少“本地副本不完整导致少 commit”的情况。
+        - 任一模块同步失败时，不中断整次查询，而是把错误写入 warnings。
+        - 仅对存在 origin 远端的仓库执行同步，本地临时测试仓库不应因此报错。
+        """
+        warnings: list[WorkspaceGitModuleWarning] = []
+        for module in modules:
+            repo_dir = module["repo_dir"]
+            context = module["context"]
+            assert isinstance(repo_dir, Path)
+            assert isinstance(context, WorkspaceGitRepoContext)
+            try:
+                self._sync_git_module(
+                    repo_dir=repo_dir,
+                    git_username=git_username,
+                    git_pat=git_pat,
+                )
+            except WorkspaceCreateError as exc:
+                warnings.append(
+                    WorkspaceGitModuleWarning(
+                        repo_path=context.repo_path,
+                        repo_name=context.repo_name,
+                        error=self._workspace_create_reason(exc),
+                    )
+                )
+        return warnings
+
+    def _sync_git_module(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> None:
+        """
+        尽力把当前模块同步到一个更适合历史检索的状态。
+
+        步骤说明：
+        1. 若存在 origin，则先把 remote.origin.fetch 修正为全量分支映射。
+        2. 若仓库是 shallow repository，则先尝试 unshallow，把历史补齐。
+        3. 最后执行一次普通 fetch --prune --tags，刷新 refs。
+
+        注意：
+        - 这里只刷新 refs 和历史，不改变当前 HEAD，因此不会改变用户工作区当前检出位置。
+        """
+        if not self._has_remote_origin(
+            repo_dir=repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        ):
+            return
+
+        self._ensure_origin_fetch_tracks_all_branches(
+            repo_dir=repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+        if self._is_shallow_repository(
+            repo_dir=repo_dir,
+            git_username=git_username,
+            git_pat=git_pat,
+        ):
+            self._run_git(
+                repo_dir,
+                ["fetch", "origin", "--unshallow", "--tags"],
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+
+        self._run_git(
+            repo_dir,
+            ["fetch", "origin", "--prune", "--tags"],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+    def _is_shallow_repository(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> bool:
+        output = self._run_git(
+            repo_dir,
+            ["rev-parse", "--is-shallow-repository"],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+        return output.strip().lower() == "true"
+
+    def _ensure_origin_fetch_tracks_all_branches(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> None:
+        fetch_specs = self._run_git(
+            repo_dir,
+            ["config", "--get-all", "remote.origin.fetch"],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+        normalized_specs = {
+            line.strip()
+            for line in fetch_specs.splitlines()
+            if line.strip()
+        }
+        full_refspec = "+refs/heads/*:refs/remotes/origin/*"
+        if full_refspec in normalized_specs:
+            return
+
+        self._run_git(
+            repo_dir,
+            ["config", "--replace-all", "remote.origin.fetch", full_refspec],
+            git_username=git_username,
+            git_pat=git_pat,
+        )
+
+    def _has_remote_origin(
+        self,
+        *,
+        repo_dir: Path,
+        git_username: str | None,
+        git_pat: str | None,
+    ) -> bool:
+        try:
+            self._run_git(
+                repo_dir,
+                ["remote", "get-url", "origin"],
+                git_username=git_username,
+                git_pat=git_pat,
+            )
+            return True
+        except WorkspaceCreateError:
+            return False
+
     def _normalize_optional(self, value: str | None) -> str | None:
         if value is None:
             return None
         trimmed = value.strip()
         return trimmed if trimmed else None
+
+    def _workspace_create_reason(self, exc: WorkspaceCreateError) -> str:
+        if isinstance(exc.details, dict) and exc.details.get("reason") is not None:
+            return str(exc.details["reason"])
+        return str(exc)
 
     def _validate_pat_support(self, git_url: str, git_pat: str | None) -> None:
         if not git_pat:

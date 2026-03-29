@@ -50,7 +50,7 @@ _SERVER_INSTRUCTIONS = """
 2. 当前入口可能是多工作空间(/mcp)或绑定工作空间(/mcp/{workspace})。
 3. 在多工作空间入口，调用 list_files/read_file/grep_files/semantic_search/hybrid_search 时应显式传 workspace。
 4. 当需要查看 Git 提交历史时，可使用 search_git_commits / get_git_commit_detail，但仅 Git 工作空间支持。
-5. 当前 Git 工具只面向“当前工作空间当前检出分支”的历史，不支持切换分支，也不支持指定其它分支。
+5. Git 提交检索会尽力同步主仓库与子模块的远端 refs，并搜索各模块本地已知 refs 中可见的提交；当前仍不支持切换分支，也不支持显式指定其它分支。
 6. 在绑定入口，工具默认作用于绑定工作空间；workspace 参数可省略，若传入必须一致。
 7. semantic_search 若向量不可用，建议回退 grep_files + read_file。
 
@@ -347,7 +347,9 @@ def build_fastmcp_asgi_app():
             "仅 Git 工作空间支持。"
             "必须传 start_time、end_time、page、page_size，author 可选。"
             "时间范围不能超过 3 个月；若超出范围，应该缩小时间窗口后重试。"
+            "查询前会尽力同步主仓库与子模块的远端 refs，并搜索各模块本地已知 refs 中可见的提交。"
             "每条结果都会明确返回所属 repo_path、repo_name、current_branch、head_commit、detached；"
+            "若某个子模块查询失败，不会拖垮整次查询，而是通过 warnings 返回具体错误。"
             "若需要查看具体改动，请继续调用 get_git_commit_detail。"
         ),
     )
